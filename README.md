@@ -1,7 +1,7 @@
 # Unsquish
 
 Un-squishes compressed images: JPEG artifact restoration, pixel-art upscaling and verified
-lossless re-saving, in one Windows exe with a window and a command line. Version 0.6.0.
+lossless re-saving, in one Windows exe with a window and a command line. Version 0.7.0.
 
 `unsquish.exe` is the whole tool in a single Windows executable: content classification,
 JPEG restoration, pixel-art upscaling, lossless re-saving, JPEG XL output, and a window
@@ -33,7 +33,8 @@ in a dark theme and remembers your settings.
 | Content: Auto-detect / Photo / Art / Pixel art / No detection | (default) / `/class photo` / `/class art` / `/class pixelart` / `/noauto` | *Art* is the one to force for anime or illustrations that were detected as photo |
 | Restoration level: Auto / 0-6 | (default) / `/qs N` | photo 4, art 6 on Auto; 5-6 for heavily crushed files |
 | Selective blur: Auto / On / Off | (default) / `/blur` / `/noblur` | photo on, art off on Auto |
-| Pixel-art upscale: Auto / Keep size / 2x-6x | (default) / `/xbrz 1` / `/xbrz N` | |
+| Pixel-art upscale: Auto / Keep size / 2x-6x | (default) / `/xbrz 1` / `/xbrz N` | Auto is enough for about 1024 px, never below an undone enlargement |
+| Pixel-art style: Crisp / Smooth | (default) / `/smooth` | Crisp keeps the blocks; Smooth is the xBRZ emulator-filter look |
 | Palette snap | `/snap N` | pixel art from JPEG only; helps few-colour sprites, hurts busy screens |
 | Restore JPEGs below quality | `/qf N` | files at or above are re-saved losslessly; 1 = everything lossless |
 | Output format: JPEG XL / PNG | `/jxl` / `/png` | |
@@ -64,7 +65,7 @@ Inputs are never modified. Existing outputs are skipped unless `/overwrite`.
 |---|---|---|
 | JPEG below the quality threshold (default 90), classed **photo** | smoothing across block seams with every DCT coefficient projected back into the interval the file allows (3 iterations), then a mild selective blur | lossless JPEG XL (`/png` for PNG), ICC and EXIF carried over |
 | same, classed **art** (flat colour, hard lines; also photographed documents) | 4 iterations, no blur | lossless JPEG XL or PNG, ICC and EXIF carried over |
-| **pixel art** (sprites, game screens, icons, nearest-neighbour enlargements; JPEG, PNG, GIF, BMP or WebP) | restoration if JPEG, undo the enlargement, optional `/snap N` palette, xBRZ 2x-4x (more after undoing a larger enlargement, so the output is never smaller than the input; 8x runs as 4x then 2x) | PNG |
+| **pixel art** (sprites, game screens, icons, nearest-neighbour enlargements; JPEG, PNG, GIF, BMP or WebP) | restoration if JPEG, undo the enlargement, optional `/snap N` palette, crisp nearest-neighbour upscale 2x-4x (never below the undone enlargement, so the output is never smaller than the input). `/smooth` uses xBRZ instead, in passes of at most 6x. A lossless input that is already an exact integer enlargement is left alone | PNG |
 | **animated pixel art** (GIF, animated PNG or WebP whose first frame is pixel art) | the same steps on every frame | animated PNG with the original frame delays and loop count |
 | JPEG at or above the threshold | reversible JPEG XL transcode, verified by rebuilding the original bytes (with `/png`: Huffman-optimized JPEG, verified coefficient by coefficient) | `.jxl` (about 20 percent smaller) or `.jpg` |
 | 12-bit, CMYK, arithmetic-coded, lossless JPEG; MPF / Ultra HDR / Motion Photo (data after the end marker) | copied unchanged, hash-verified | `.jpg` |
@@ -80,7 +81,7 @@ action, sizes and timing per file.
   hard edges in both (large photos look hard-edged on the proxy only)
 - **colour density** (unique colours per pixel): palette images are below 2 percent
 - **pixel grid**: a nearest-neighbour round trip that beats a box-filtered one by 3 dB
-  reveals a 2x-8x nearest-neighbour enlargement, which is undone before xBRZ. Every grid
+  reveals a 2x-8x nearest-neighbour enlargement, which is undone before upscaling. Every grid
   phase is tried, because a cropped or padded sprite rarely starts on a cell boundary.
 - **palette texture**: a GIF has at most 256 colours and dithered edges, which makes any
   small GIF look like a sprite. A quantized soft picture gives itself away by its texture:
@@ -105,8 +106,9 @@ offset grid is now recognized as pixel art.
 | `/qf N` | quality-factor threshold, default 90 |
 | `/qs N` | force the restoration level 0-6 (0-2: 2 iterations, 3-4: 3, 5-6: 4 with a wider smoothing scale) |
 | `/blur`, `/noblur` | force the selective-blur stage on or off |
-| `/xbrz N` | force the xBRZ factor for pixel art (1 = keep size, 2-6); default: enough for about 1024 px, at least the undone enlargement |
-| `/snap N` | pixel art from JPEG only: median-cut to N colours before xBRZ (off by default; helps few-colour sprites, hurts rich screens) |
+| `/xbrz N` | pixel-art upscale factor (1 = keep size, 2-6); default: enough for about 1024 px, at least the undone enlargement |
+| `/smooth` | pixel art: xBRZ smoothing (stair-steps become curves) instead of the crisp nearest-neighbour upscale |
+| `/snap N` | pixel art from JPEG only: median-cut to N colours before upscaling (off by default; helps few-colour sprites, hurts rich screens) |
 | `/jxl`, `/png` | restored output format (JPEG XL default); `/png` also makes the lossless branch write Huffman-optimized JPEGs |
 | `/threads N` | CPU threads for restoration and JPEG XL encoding |
 | `/norecurse`, `/overwrite`, `/dry`, `/features`, `/gui`, `/?` | as named; `/features` prints the classifier measurements per file |

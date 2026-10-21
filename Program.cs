@@ -15,6 +15,7 @@ public sealed class Options
     public bool Blur = true, Dry, Overwrite, Recurse = true, Auto = true;
     public int Qf = 90, Qs = 4, Threads = Environment.ProcessorCount, Xbrz, Snap;
     public bool ExplicitQs, ExplicitBlur, Features;
+    public bool Smooth;                  // pixel art: xBRZ smoothing instead of the crisp nearest-neighbour upscale
     public string Mode = "jxl";          // restored output: jxl or png
     public string? ForceClass;           // photo | art | pixelart: skip the classifier's verdict
 }
@@ -24,7 +25,7 @@ public sealed class RunResult { public Dictionary<string, int> Counts = new(); p
 /// <summary>Everything the tool does, driven by Options; reports through callbacks so the CLI and the window share it.</summary>
 public static class Engine
 {
-    public const string Version = "0.6.0";
+    public const string Version = "0.7.0";
 
     public static RunResult Run(Options o, Action<string, ConsoleColor?> log, Action<int, int>? progress = null, CancellationToken ct = default)
     {
@@ -55,8 +56,8 @@ public static class Engine
 
         log($"unsquish {Version}: {files.Count} image file(s); output -> {outDir}", ConsoleColor.White);
         var forced = new List<string>();
-        if (o.ExplicitQs) forced.Add("level " + o.Qs); if (o.ExplicitBlur) forced.Add("blur " + (o.Blur ? "on" : "off")); if (o.Xbrz > 0) forced.Add("xbrz " + o.Xbrz + "x"); if (o.Snap > 0) forced.Add("snap " + o.Snap + " colours"); if (o.ForceClass != null) forced.Add("class " + o.ForceClass);
-        log(o.Auto ? "  auto:   photo -> level 4 + blur; art -> level 6, no blur; pixel art -> xBRZ" + (forced.Count > 0 ? "  (forced: " + string.Join(", ", forced) + ")" : "")
+        if (o.ExplicitQs) forced.Add("level " + o.Qs); if (o.ExplicitBlur) forced.Add("blur " + (o.Blur ? "on" : "off")); if (o.Xbrz > 0) forced.Add("scale " + o.Xbrz + "x"); if (o.Smooth) forced.Add("smooth xBRZ"); if (o.Snap > 0) forced.Add("snap " + o.Snap + " colours"); if (o.ForceClass != null) forced.Add("class " + o.ForceClass);
+        log(o.Auto ? "  auto:   photo -> level 4 + blur; art -> level 6, no blur; pixel art -> crisp upscale" + (forced.Count > 0 ? "  (forced: " + string.Join(", ", forced) + ")" : "")
                    : $"  auto:   off (every JPEG below qf {o.Qf} is treated as a photo)", null);
         log($"  jxl:    {(Jxl.Available ? "libjxl " + Jxl.VersionString + " (bundled)" : "not available")}", null);
         log($"  mode: {o.Mode}, level {o.Qs}, blur {(o.Blur ? "on" : "off")}, threshold qf {o.Qf}, threads {o.Threads}{(o.Dry ? ", DRY RUN" : "")}", null);
@@ -149,13 +150,15 @@ public static class Engine
     {
         if (frames > 1)
         {
-            if (o.Auto && cls.Class == "pixelart") return ("pixelart", $"animated pixel art ({frames} frames): {cls.Note}");
+            if (o.Auto && cls.Class == "pixelart")
+                return CleanScaled(cls, o) ? ("skip", $"clean pixel art at {cls.GridK}x integer scale ({frames} frames), nothing to do") : ("pixelart", $"animated pixel art ({frames} frames): {cls.Note}");
             return ("skip", $"animated image ({frames} frames), not pixel art" + (cls.Class != "-" ? $" ({cls.Class})" : ""));
         }
         if (!info.IsJpeg)
         {
             if (fmt == "unknown") return ("skip", "unrecognized file format");
-            if (o.Auto && cls.Class == "pixelart") return ("pixelart", "pixel art: " + cls.Note);
+            if (o.Auto && cls.Class == "pixelart")
+                return CleanScaled(cls, o) ? ("skip", $"clean pixel art at {cls.GridK}x integer scale, nothing to do") : ("pixelart", "pixel art: " + cls.Note);
             return ("skip", $"{fmt} is not a JPEG, nothing to restore ({cls.Class})");
         }
         if (!info.Ok) return ("skip", info.Error);
@@ -170,6 +173,10 @@ public static class Engine
         if (o.Auto && cls.Class != "-" && cls.Class != "unknown") return ("restore", $"quality {info.Qf} < {o.Qf}, {cls.Class}");
         return ("restore", $"quality {info.Qf} < {o.Qf}");
     }
+
+    /// <summary>A lossless input that is already an exact integer enlargement of pixel art: the crisp default would
+    /// reproduce it pixel for pixel, so it is left alone unless the user asked for a factor or for xBRZ smoothing.</summary>
+    static bool CleanScaled(ClassResult cls, Options o) => cls.GridK >= 2 && !o.Smooth && o.Xbrz == 0;
 
     static (bool, string, string?, string) DoRestore(string f, string outBase, int level, bool blur, RgbImage? plain, JpegInfo info, Options o)
     {
@@ -232,9 +239,19 @@ public static class Engine
     }
     static byte[] Hash(string p) { using var s = File.OpenRead(p); return SHA256.HashData(s); }
 
-    /// <summary>xBRZ factor for a native-size pixel image: enough for about 1024 px (2-4x), and never below the undone
+    /// <summary>Upscale factor for a native-size pixel image: enough for about 1024 px (2-4x), and never below the undone
     /// nearest-neighbour factor, so the output is at least as large as the input. /xbrz N overrides.</summary>
-    static int XbrzFactor(Options o, int w, int h, int gridK) => o.Xbrz > 0 ? o.Xbrz : Math.Max(Math.Max(2, Math.Min(4, (int)Math.Ceiling(1024.0 / Math.Max(1, Math.Max(w, h))))), gridK);
+    static int UpscaleFactor(Options o, int w, int h, int gridK) => o.Xbrz > 0 ? o.Xbrz : Math.Max(Math.Max(2, Math.Min(4, (int)Math.Ceiling(1024.0 / Math.Max(1, Math.Max(w, h))))), gridK);
+
+    /// <summary>Crisp nearest-neighbour upscale (the default: blocks stay blocks), or xBRZ smoothing with /smooth.</summary>
+    static RgbImage Upscale(RgbImage img, int f, bool smooth, out string how)
+    {
+        bool alpha = img.HasAlpha;
+        if (!smooth) { how = $"nearest-neighbour {f}x" + (alpha ? " with alpha" : ""); return img.ResamplePoint(img.W * f, img.H * f); }
+        var r = XbrzScale(img, f, alpha, out string passes);
+        how = $"xBRZ {f}x" + (passes.Contains("then") ? $" ({passes})" : "") + (alpha ? " with alpha" : "");
+        return r;
+    }
 
     /// <summary>Scales by f with xBRZ in passes of at most 6x (the scaler's limit): 8x is 4x then 2x.</summary>
     static RgbImage XbrzScale(RgbImage img, int f, bool alpha, out string passes)
@@ -260,19 +277,18 @@ public static class Engine
         var (frames, loop) = anim.Value; var steps = new List<string>();
         int w = frames[0].Image.W, h = frames[0].Image.H;
         if (cls.GridK >= 2) { w = Math.Max(1, w / cls.GridK); h = Math.Max(1, h / cls.GridK); steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
-        int factor = XbrzFactor(o, w, h, cls.GridK);
+        int factor = UpscaleFactor(o, w, h, cls.GridK);
         const long maxPixels = 250_000_000;   // all output frames in memory at once: keep it under about 1 GB
         while (factor > 1 && (long)frames.Count * w * factor * h * factor > maxPixels) factor--;
-        bool alpha = frames.Any(fr => fr.Image.HasAlpha);
-        var outFrames = new List<RgbImage>(frames.Count); var delays = new List<int>(frames.Count); string passes = "";
+        var outFrames = new List<RgbImage>(frames.Count); var delays = new List<int>(frames.Count); string how = "native size";
         foreach (var fr in frames)
         {
             var img = fr.Image;
             if (cls.GridK >= 2) img = img.ResamplePoint(w, h);
-            if (factor > 1) img = XbrzScale(img, factor, alpha, out passes);
+            if (factor > 1) img = Upscale(img, factor, o.Smooth, out how);
             outFrames.Add(img); delays.Add(fr.DelayMs);
         }
-        steps.Add(factor > 1 ? $"xBRZ {factor}x" + (passes.Contains("then") ? $" ({passes})" : "") + (alpha ? " with alpha" : "") : "native size");
+        steps.Add(how);
         string outp = outBase + ".png"; Animation.WriteApng(outp, outFrames, delays, loop);
         return (true, string.Join(" + ", steps) + $" -> animated png ({frames.Count} frames)", outp, $"native {w}x{h}, {frames.Count} frames");
     }
@@ -289,14 +305,9 @@ public static class Engine
         if (img == null) return (false, "decode", null, "could not decode");
         if (cls.GridK >= 2) { img = img.ResamplePoint(Math.Max(1, img.W / cls.GridK), Math.Max(1, img.H / cls.GridK)); steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
         if (o.Snap > 0 && info.IsJpeg) { img = Filters.MedianCut(img, o.Snap); steps.Add($"snap to {o.Snap} colours"); }
-        int factor = XbrzFactor(o, img.W, img.H, cls.GridK);
+        int factor = UpscaleFactor(o, img.W, img.H, cls.GridK);
         int nw = img.W, nh = img.H;
-        if (factor > 1)
-        {
-            bool alpha = img.HasAlpha;
-            img = XbrzScale(img, factor, alpha, out string passes);
-            steps.Add($"xBRZ {factor}x" + (passes.Contains("then") ? $" ({passes})" : "") + (alpha ? " with alpha" : ""));
-        }
+        if (factor > 1) { img = Upscale(img, factor, o.Smooth, out string how); steps.Add(how); }
         else if (steps.Count == 0) steps.Add("native size");
         string outp = outBase + ".png"; Png.Write(outp, img);
         return (true, string.Join(" + ", steps) + " -> png", outp, $"native {nw}x{nh}");
@@ -319,7 +330,8 @@ public static class Cli
         W("  - PHOTO  (soft edges, texture)      JPEG below /qf -> coefficient-constrained smoothing (level 4) + mild selective blur");
         W("  - ART    (flat colour, hard lines)  JPEG below /qf -> coefficient-constrained smoothing (level 6), no blur");
         W("  - PIXEL ART (1-px edges, or an exact nearest-neighbour upscale) -> restoration if JPEG, undo the");
-        W("               nearest-neighbour upscale, optional palette snap, xBRZ 2-4x -> PNG");
+        W("               nearest-neighbour upscale, optional palette snap, crisp nearest-neighbour upscale to ~1024 px");
+        W("               (xBRZ smoothing with /smooth) -> PNG; clean pixel art already at an integer scale is left alone");
         W("  - any JPEG at/above /qf -> LOSSLESS: reversible JPEG XL transcode, verified by rebuilding the original bytes");
         W("               (with /png: same coefficients re-encoded with optimized Huffman tables, verified coefficient by coefficient)");
         W("  - 12-bit, CMYK, arithmetic, lossless-JPEG, MPF/Ultra HDR (data after EOI) -> COPY unchanged (hash-verified)");
@@ -334,8 +346,9 @@ public static class Cli
         W("  /qf N        quality-factor threshold (default 90): restore files below N; /qf 1 = lossless for everything");
         W("  /qs N        force the restoration level 0-6 for every class (0-2 fast: 2 iterations; 3-4: 3; 5-6: 4)");
         W("  /blur /noblur  force the selective-blur stage on or off for every class");
-        W("  /xbrz N      force the xBRZ factor for pixel art (1 = keep size, 2-6; default: enough for ~1024 px)");
-        W("  /snap N      pixel art from JPEG only: snap to an N-colour palette before xBRZ (off by default)");
+        W("  /xbrz N      pixel-art upscale factor (1 = keep size, 2-6; default: enough for ~1024 px, at least the undone enlargement)");
+        W("  /smooth      pixel art: xBRZ smoothing (curves instead of blocks) in place of the crisp nearest-neighbour upscale");
+        W("  /snap N      pixel art from JPEG only: snap to an N-colour palette before upscaling (off by default)");
         W("  /jxl /png    restored output format: lossless JPEG XL (default) or PNG; /png also makes the lossless");
         W("               branch write Huffman-optimized JPEGs instead of JPEG XL");
         W("  /threads N   CPU threads for restoration and JPEG XL encoding (default: all)");
@@ -364,6 +377,7 @@ public static class Cli
                 case "/blur": o.Blur = true; o.ExplicitBlur = true; break;
                 case "/auto": o.Auto = true; break;
                 case "/noauto": o.Auto = false; break;
+                case "/smooth": o.Smooth = true; break;
                 case "/dry": o.Dry = true; break;
                 case "/features": o.Dry = true; o.Features = true; break;
                 case "/overwrite": o.Overwrite = true; break;

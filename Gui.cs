@@ -28,7 +28,8 @@ sealed class MainForm : Form
     readonly ComboBox content = Combo("Auto-detect: photo / art / pixel art", "Photo", "Art (anime, flat colour, scanned documents)", "Pixel art", "No detection: every JPEG is a photo");
     readonly ComboBox level = Combo("Auto (photo 4, art 6)", "0 (fastest, mildest)", "1", "2 (fast)", "3", "4", "5", "6 (strongest)");
     readonly ComboBox blur = Combo("Auto (photo on, art off)", "On", "Off");
-    readonly ComboBox xbrz = Combo("Auto (xBRZ up to ~1024 px)", "Keep size (no upscale)", "2x", "3x", "4x", "5x", "6x");
+    readonly ComboBox xbrz = Combo("Auto (up to ~1024 px)", "Keep size (no upscale)", "2x", "3x", "4x", "5x", "6x");
+    readonly ComboBox style = Combo("Crisp (nearest-neighbour)", "Smooth (xBRZ)");
     readonly ComboBox format = Combo("JPEG XL (lossless, ~20% smaller)", "PNG (opens anywhere)");
     readonly NumericUpDown snap = new() { Minimum = 0, Maximum = 256, Value = 0, Width = 70 };
     readonly NumericUpDown qf = new() { Minimum = 1, Maximum = 100, Value = 90, Width = 70 };
@@ -94,13 +95,15 @@ sealed class MainForm : Form
         Row(1, "Restoration level:", level, "Restore JPEGs below quality:", qf);
         Row(2, "Selective blur:", blur, "Pixel-art upscale:", xbrz);
         Row(3, "Palette snap, colours (0 = off):", snap, "Threads:", threads);
+        grid.Controls.Add(new Label { Text = "Pixel-art style:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 4); grid.Controls.Add(style, 1, 4);
         grid.Controls.Add(reset, 3, 4); reset.Anchor = AnchorStyles.Right;
         setGroup.Controls.Add(grid); root.Controls.Add(setGroup, 0, 2);
         var tips = new ToolTip { AutoPopDelay = 15000, InitialDelay = 400 };
         tips.SetToolTip(content, "Auto-detect looks at edges, colour count and pixel grids. Force a type when the log shows a wrong class.");
         tips.SetToolTip(level, "0-2: fast and mild (2 iterations). 3-4: default (3). 5-6: strongest, for heavily crushed files (4).");
         tips.SetToolTip(blur, "A mild selective blur after restoration. Good for photos, bad for line art.");
-        tips.SetToolTip(xbrz, "Pixel art is upscaled with xBRZ. Keep size writes it at native resolution.");
+        tips.SetToolTip(xbrz, "Upscale factor for pixel art. Auto is enough for about 1024 px and never below an undone enlargement. Keep size writes it at native resolution.");
+        tips.SetToolTip(style, "Crisp keeps every pixel a block (the pixel-art look). Smooth redraws stair-steps as curves with xBRZ, the emulator-filter look. Clean pixel art that is already at an integer scale is left alone on Crisp.");
         tips.SetToolTip(snap, "Pixel art that came from a JPEG: snap to this many colours before upscaling. Helps few-colour sprites, hurts busy scenes.");
         tips.SetToolTip(qf, "JPEGs below this quality factor are restored; files at or above it are re-saved losslessly. 1 = lossless for everything.");
         tips.SetToolTip(format, "JPEG XL files are about 20% smaller than the JPEG and losslessly hold the restored pixels. PNG opens anywhere.");
@@ -146,7 +149,7 @@ sealed class MainForm : Form
             c.DragDrop += (_, e) => { if (e.Data?.GetData(DataFormats.FileDrop) is string[] paths) AddInputs(paths); };
         }
         snap.ValueChanged += (_, _) => { if (snap.Value == 1) snap.Value = 2; };
-        reset.Click += (_, _) => { content.SelectedIndex = level.SelectedIndex = blur.SelectedIndex = xbrz.SelectedIndex = format.SelectedIndex = 0; snap.Value = 0; qf.Value = 90; threads.Value = Environment.ProcessorCount; };
+        reset.Click += (_, _) => { content.SelectedIndex = level.SelectedIndex = blur.SelectedIndex = xbrz.SelectedIndex = style.SelectedIndex = format.SelectedIndex = 0; snap.Value = 0; qf.Value = 90; threads.Value = Environment.ProcessorCount; };
         run.Click += (_, _) => StartRun(false);
         preview.Click += (_, _) => StartRun(true);
         cancel.Click += (_, _) => { cts?.Cancel(); status.Text = "Cancelling after the current file..."; cancel.Enabled = false; };
@@ -184,6 +187,7 @@ sealed class MainForm : Form
         if (level.SelectedIndex > 0) { o.Qs = level.SelectedIndex - 1; o.ExplicitQs = true; }
         if (blur.SelectedIndex > 0) { o.Blur = blur.SelectedIndex == 1; o.ExplicitBlur = true; }
         if (xbrz.SelectedIndex > 0) o.Xbrz = xbrz.SelectedIndex;   // 1 = keep size, 2..6 = factor
+        o.Smooth = style.SelectedIndex == 1;
         return o;
     }
 
@@ -217,7 +221,7 @@ sealed class MainForm : Form
 
     void SetBusy(bool busy)
     {
-        foreach (Control c in new Control[] { addFiles, addFolder, remove, clear, browseOut, recurse, overwrite, content, level, blur, xbrz, format, snap, qf, threads, reset, run, preview, outBox }) c.Enabled = !busy;
+        foreach (Control c in new Control[] { addFiles, addFolder, remove, clear, browseOut, recurse, overwrite, content, level, blur, xbrz, style, format, snap, qf, threads, reset, run, preview, outBox }) c.Enabled = !busy;
         cancel.Enabled = busy; UseWaitCursor = busy;
     }
 
@@ -240,7 +244,9 @@ sealed class MainForm : Form
             "  Photo (soft edges, texture)            JPEG below the quality threshold: coefficient-constrained smoothing level 4 + mild selective blur\r\n" +
             "  Art (anime, flat colour, documents)    JPEG below the threshold: smoothing level 6, no blur (blur would soften line work)\r\n" +
             "  Pixel art (1-px edges or an exact NN   restoration if JPEG, undo the nearest-neighbour enlargement, optional palette snap,\r\n" +
-            "            enlargement)                 xBRZ upscale to about 1024 px -> PNG (transparency kept)\r\n" +
+            "            enlargement)                 crisp nearest-neighbour upscale to about 1024 px -> PNG (transparency kept).\r\n" +
+            "                                         Clean pixel art already at an integer scale is left alone.\r\n" +
+            "  Animated pixel art (GIF/PNG/WebP)      the same for every frame -> animated PNG with the original timing\r\n" +
             "  Any JPEG at/above the threshold        re-saved losslessly: reversible JPEG XL (about 20% smaller), verified by rebuilding the\r\n" +
             "                                         original bytes; with PNG output: same JPEG with optimized Huffman tables\r\n" +
             "  12-bit, CMYK, arithmetic, lossless JPEG, MPF / Ultra HDR   copied unchanged (hash-verified)\r\n" +
@@ -253,6 +259,7 @@ sealed class MainForm : Form
             "  Portraits with fine skin texture          Blur = Off if the result looks waxy.\r\n" +
             "  Pixel art / sprites / game screenshots    Auto. Palette snap only for sprites with few colours (it hurts busy scenes).\r\n" +
             "  Keep pixel art at native size             Pixel-art upscale = Keep size.\r\n" +
+            "  Smooth, emulator-filter look              Pixel-art style = Smooth (xBRZ redraws the stair-steps as curves).\r\n" +
             "  Already good JPEGs (quality >= 90)        nothing is restored; they are re-saved losslessly. Raise the threshold to\r\n" +
             "                                            restore more files, lower it (e.g. 1) to make everything lossless.\r\n" +
             "  Viewer cannot open .jxl                   Output format = PNG (larger files; lossless JPEGs stay .jpg).\r\n" +
@@ -270,7 +277,7 @@ sealed class MainForm : Form
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
-            File.WriteAllLines(SettingsPath, new[] { $"content={content.SelectedIndex}", $"level={level.SelectedIndex}", $"blur={blur.SelectedIndex}", $"xbrz={xbrz.SelectedIndex}", $"format={format.SelectedIndex}",
+            File.WriteAllLines(SettingsPath, new[] { $"content={content.SelectedIndex}", $"level={level.SelectedIndex}", $"blur={blur.SelectedIndex}", $"xbrz={xbrz.SelectedIndex}", $"style={style.SelectedIndex}", $"format={format.SelectedIndex}",
                 $"snap={snap.Value}", $"qf={qf.Value}", $"threads={threads.Value}", $"recurse={recurse.Checked}", $"overwrite={overwrite.Checked}", $"width={Width}", $"height={Height}" });
         }
         catch { }
@@ -284,7 +291,7 @@ sealed class MainForm : Form
             var kv = File.ReadAllLines(SettingsPath).Select(l => l.Split('=', 2)).Where(a => a.Length == 2).ToDictionary(a => a[0], a => a[1]);
             void Sel(ComboBox c, string k) { if (kv.TryGetValue(k, out var v) && int.TryParse(v, out int i) && i >= 0 && i < c.Items.Count) c.SelectedIndex = i; }
             void Num(NumericUpDown n, string k) { if (kv.TryGetValue(k, out var v) && decimal.TryParse(v, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) && d >= n.Minimum && d <= n.Maximum) n.Value = d; }
-            Sel(content, "content"); Sel(level, "level"); Sel(blur, "blur"); Sel(xbrz, "xbrz"); Sel(format, "format");
+            Sel(content, "content"); Sel(level, "level"); Sel(blur, "blur"); Sel(xbrz, "xbrz"); Sel(style, "style"); Sel(format, "format");
             Num(snap, "snap"); Num(qf, "qf"); Num(threads, "threads");
             if (kv.TryGetValue("recurse", out var r)) recurse.Checked = r == "True"; if (kv.TryGetValue("overwrite", out var ow)) overwrite.Checked = ow == "True";
             if (kv.TryGetValue("width", out var w) && kv.TryGetValue("height", out var h) && int.TryParse(w, out int wi) && int.TryParse(h, out int hi) && wi >= MinimumSize.Width && hi >= MinimumSize.Height) Size = new Size(wi, hi);

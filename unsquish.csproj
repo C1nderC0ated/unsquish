@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>unsquish</AssemblyName>
     <RootNamespace>Unsquish</RootNamespace>
-    <Version>0.6.0</Version>
+    <Version>0.7.0</Version>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
