@@ -53,7 +53,7 @@ public static class Animation
         catch { return null; }
     }
 
-    static int Ms(Rational r) => r.Denominator == 0 ? 100 : (int)Math.Round(1000.0 * r.Numerator / r.Denominator);
+    static int Ms(Rational r) => (int)Math.Round(1000.0 * r.Numerator / (r.Denominator == 0 ? 100 : r.Denominator));   // APNG: a zero denominator means 100
 
     static RgbImage ToRgb(ImageFrame<Rgba32> fr)
     {

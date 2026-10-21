@@ -25,7 +25,7 @@ public sealed class RunResult { public Dictionary<string, int> Counts = new(); p
 /// <summary>Everything the tool does, driven by Options; reports through callbacks so the CLI and the window share it.</summary>
 public static class Engine
 {
-    public const string Version = "0.7.0";
+    public const string Version = "0.7.1";
 
     public static RunResult Run(Options o, Action<string, ConsoleColor?> log, Action<int, int>? progress = null, CancellationToken ct = default)
     {
@@ -38,7 +38,7 @@ public static class Engine
         string? firstFolder = null, firstFileDir = null;
         foreach (var inp in o.Inputs)
         {
-            string full = Path.GetFullPath(inp).TrimEnd('\\');
+            string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(inp));   // keeps a drive root such as E:\ intact
             if (Directory.Exists(full))
             {
                 firstFolder ??= full;
@@ -48,13 +48,27 @@ public static class Engine
             else if (File.Exists(full)) { firstFileDir ??= Path.GetDirectoryName(full)!; files.Add((full, Path.GetDirectoryName(full)!)); }
             else log("Input not found: " + inp, ConsoleColor.Red);
         }
-        string outDir = o.Output != null ? Path.GetFullPath(o.Output) : (firstFolder != null ? firstFolder + "_restored" : Path.Combine(firstFileDir ?? ".", "_restored"));
-        string outPrefix = outDir.TrimEnd('\\') + "\\";
-        files = files.Where(f => !f.path.StartsWith(outPrefix, StringComparison.OrdinalIgnoreCase)).ToList();
+        string outDir = Path.GetFullPath(o.Output ?? (firstFolder != null ? DefaultOut(firstFolder) : Path.Combine(firstFileDir ?? ".", "_restored")));
         if (!o.Dry) Directory.CreateDirectory(outDir);
+        // The same file given twice, and anything living inside the output folder, are not inputs. Compared by resolved
+        // identity, so a mapped drive, a subst drive or a junction that names the output folder is caught as well.
+        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var dirCanon = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string outCanon = Paths.Canon(outDir).TrimEnd('\\');
+        int dropped = 0; var kept = new List<(string path, string baseDir)>(files.Count);
+        foreach (var fb in files)
+        {
+            string dir = Path.GetDirectoryName(fb.path) ?? fb.path;
+            if (!dirCanon.TryGetValue(dir, out var dc)) { dc = Paths.Canon(dir).TrimEnd('\\'); dirCanon[dir] = dc; }
+            if (!seenPaths.Add(Path.Combine(dc, Path.GetFileName(fb.path)))) continue;
+            if (dc.Equals(outCanon, StringComparison.OrdinalIgnoreCase) || dc.StartsWith(outCanon + "\\", StringComparison.OrdinalIgnoreCase)) { dropped++; continue; }
+            kept.Add(fb);
+        }
+        files = kept;
         result.OutDir = outDir; result.Files = files.Count;
 
         log($"unsquish {Version}: {files.Count} image file(s); output -> {outDir}", ConsoleColor.White);
+        if (dropped > 0) log($"  note: {dropped} input file(s) lie inside the output folder and are skipped; an output folder cannot also be an input", ConsoleColor.Yellow);
         var forced = new List<string>();
         if (o.ExplicitQs) forced.Add("level " + o.Qs); if (o.ExplicitBlur) forced.Add("blur " + (o.Blur ? "on" : "off")); if (o.Xbrz > 0) forced.Add("scale " + o.Xbrz + "x"); if (o.Smooth) forced.Add("smooth xBRZ"); if (o.Snap > 0) forced.Add("snap " + o.Snap + " colours"); if (o.ForceClass != null) forced.Add("class " + o.ForceClass);
         log(o.Auto ? "  auto:   photo -> level 4 + blur; art -> level 6, no blur; pixel art -> crisp upscale" + (forced.Count > 0 ? "  (forced: " + string.Join(", ", forced) + ")" : "")
@@ -66,6 +80,7 @@ public static class Engine
         var csv = new List<string> { "\"file\",\"class\",\"confidence\",\"edge_ratio\",\"grid\",\"colors\",\"route\",\"reason\",\"qf\",\"exact_tables\",\"progressive\",\"comps\",\"action\",\"in_bytes\",\"out_bytes\",\"ms\",\"status\",\"message\"" };
         var counts = new Dictionary<string, int> { ["restore"] = 0, ["lossless"] = 0, ["pixelart"] = 0, ["copy"] = 0, ["skip"] = 0, ["exists"] = 0, ["fail"] = 0 };
         var swAll = System.Diagnostics.Stopwatch.StartNew(); int n = 0;
+        var claimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // output stems written by this run
         foreach (var (f, baseDir) in files)
         {
             if (ct.IsCancellationRequested) { log("Cancelled.", ConsoleColor.Yellow); break; }
@@ -73,8 +88,14 @@ public static class Engine
             string rel = f.Substring(baseDir.Length).TrimStart('\\');
             string relBase = Path.Combine(Path.GetDirectoryName(rel) ?? "", Path.GetFileNameWithoutExtension(rel));
             string outBase = Path.Combine(outDir, relBase);
-            string status = "ok", msg = "", action = ""; long outBytes = 0; long inBytes = new FileInfo(f).Length;
-            string fmt = Loader.Sniff(f);
+            string status = "ok", msg = "", action = ""; long outBytes = 0, inBytes = 0; string fmt;
+            try { inBytes = new FileInfo(f).Length; fmt = Loader.Sniff(f); }
+            catch (Exception ex)
+            {
+                counts["fail"]++; log($"[{n}/{files.Count}] {rel}  FAIL  read: {ex.Message}", ConsoleColor.Red);
+                csv.Add(string.Join(",", Csv(f), "-", "0", "-1", "1", "0", "-", Csv(""), "0", "False", "False", "0", Csv("read"), 0, 0, sw.ElapsedMilliseconds, "fail", Csv(ex.Message)));
+                continue;
+            }
             JpegInfo info;
             if (fmt == "jpeg") { try { info = JpegProbe.Probe(f); } catch (Exception ex) { info = new JpegInfo { IsJpeg = true, Error = "probe failed: " + ex.Message }; } }
             else info = new JpegInfo { Error = fmt == "unknown" ? "unrecognized file format" : "not a JPEG" };
@@ -91,9 +112,14 @@ public static class Engine
                 if (o.ForceClass != null && decoded != null) { cls.Class = o.ForceClass; cls.Confidence = 1; cls.Note = "forced"; }
             }
             var (route, reason) = Route(info, o, cls, fmt, frames);
+            // two inputs with the same relative name (D:\2019\IMG_0001.jpg and D:\2020\IMG_0001.jpg) must not share an output;
+            // a skipped file writes nothing and claims nothing
+            string wanted = outBase; int dup = 1;
+            if (route != "skip") while (!claimed.Add(outBase)) outBase = $"{wanted} ({++dup})";
             int effQs = o.Qs; bool effBlur = o.Blur;
             if (o.Auto && cls.Class == "art") { if (!o.ExplicitQs) effQs = 6; if (!o.ExplicitBlur) effBlur = false; }
             string tag = $"[{n}/{files.Count}] {rel}" + (o.Auto && cls.Class != "-" ? $"  [{cls.Class} {cls.Confidence.ToString("0.00", CultureInfo.InvariantCulture)}]" : "");
+            if (dup > 1) log($"{tag}  note: same name as an earlier input, written as {Path.GetFileName(outBase)}.*", ConsoleColor.Yellow);
             if (route == "skip") { status = "skip"; msg = reason; counts["skip"]++; log($"{tag}  SKIP  {msg}", ConsoleColor.Yellow); }
             else if (o.Dry)
             {
@@ -103,15 +129,18 @@ public static class Engine
             }
             else
             {
-                string ext = route switch { "copy" => ".jpg", "lossless" => (o.Mode == "jxl" ? ".jxl" : ".jpg"), "pixelart" => ".png", _ => (o.Mode == "jxl" ? ".jxl" : ".png") };
-                string existing = outBase + ext;
-                if (File.Exists(existing) && !o.Overwrite) { status = "exists"; msg = "output exists (use /overwrite)"; counts["exists"]++; log($"{tag}  EXISTS  {existing}", ConsoleColor.DarkGray); }
+                // every name this route can produce (the lossless route may fall back from .jxl to .jpg)
+                string[] exts = route switch { "copy" => new[] { ".jpg" }, "lossless" => o.Mode == "jxl" ? new[] { ".jxl", ".jpg" } : new[] { ".jpg" }, "pixelart" => new[] { ".png" }, _ => new[] { o.Mode == "jxl" ? ".jxl" : ".png" } };
+                string? existing = exts.Select(e => outBase + e).FirstOrDefault(File.Exists);
+                string? self = exts.Select(e => outBase + e).FirstOrDefault(p => File.Exists(p) && Paths.SameFile(f, p));
+                if (self != null) { status = "fail"; msg = "the output path is the input file itself"; counts["fail"]++; log($"{tag}  FAIL  {msg}: {self}", ConsoleColor.Red); }
+                else if (existing != null && !o.Overwrite) { status = "exists"; msg = "output exists (use /overwrite)"; counts["exists"]++; log($"{tag}  EXISTS  {existing}", ConsoleColor.DarkGray); }
                 else
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(outBase)!);
                     (bool ok, string act, string? outPath, string m) res;
                     try
                     {
+                        Directory.CreateDirectory(Path.GetDirectoryName(outBase)!);
                         res = route switch
                         {
                             "restore" => DoRestore(f, outBase, effQs, effBlur, decoded, info, o),
@@ -134,17 +163,57 @@ public static class Engine
             csv.Add(string.Join(",", Csv(f), cls.Class, cls.Confidence.ToString("0.00", CultureInfo.InvariantCulture), cls.HardRatio.ToString(CultureInfo.InvariantCulture), cls.GridK, cls.Colors, route, Csv(reason), info.Qf, info.Exact, info.Progressive, info.Comps, Csv(action), inBytes, outBytes, sw.ElapsedMilliseconds, status, Csv(msg)));
         }
         swAll.Stop(); result.Seconds = swAll.Elapsed.TotalSeconds; result.Counts = counts;
-        if (!o.Dry && files.Count > 0) File.WriteAllLines(Path.Combine(outDir, "unsquish_log.csv"), csv, new UTF8Encoding(true));
+        string? csvPath = null;
+        if (!o.Dry && files.Count > 0)
+        {
+            csvPath = Path.Combine(outDir, "unsquish_log.csv");
+            try { File.WriteAllLines(csvPath, csv, new UTF8Encoding(true)); }
+            catch (Exception ex)
+            {
+                // the previous log is open in a spreadsheet, or the folder turned read-only: never lose the run over it
+                string alt = Path.Combine(outDir, $"unsquish_log_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+                try { File.WriteAllLines(alt, csv, new UTF8Encoding(true)); log($"  note: unsquish_log.csv could not be written ({ex.Message}); the log is {Path.GetFileName(alt)}", ConsoleColor.Yellow); csvPath = alt; }
+                catch (Exception ex2) { log("  note: the CSV log could not be written: " + ex2.Message, ConsoleColor.Yellow); csvPath = null; }
+            }
+        }
         log("", null);
         string summary = o.Dry
             ? $"DRY RUN, nothing written. Without the preview this would: restore {counts["restore"]}, re-save {counts["lossless"]} losslessly, upscale {counts["pixelart"]} pixel-art, copy {counts["copy"]}, skip {counts["skip"]}. Output folder would be {outDir}"
             : $"Done in {swAll.Elapsed.TotalSeconds.ToString("n1", CultureInfo.InvariantCulture)} s: {counts["restore"]} restored, {counts["lossless"]} lossless, {counts["pixelart"]} pixel-art, {counts["copy"]} copied, {counts["skip"]} skipped, {counts["exists"]} already existed, {counts["fail"]} failed";
         log(summary, counts["fail"] > 0 ? ConsoleColor.Red : ConsoleColor.White);
-        if (!o.Dry && files.Count > 0) log("Log: " + Path.Combine(outDir, "unsquish_log.csv"), null);
+        if (csvPath != null) log("Log: " + csvPath, null);
         return result;
     }
 
     static string Csv(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
+    /// <summary>Default output next to the input folder; a drive root gets a folder inside it.</summary>
+    static string DefaultOut(string folder) => Path.GetPathRoot(folder) == folder ? Path.Combine(folder, "_restored") : folder + "_restored";
+
+    /// <summary>Writes through a temporary name in the same folder and renames once the write (and its verification)
+    /// succeeded, so a failure or a Ctrl+C never leaves a truncated file under the final name.</summary>
+    static void Atomic(string outp, Action<string> write)
+    {
+        string tmp = outp + ".partial";
+        try { write(tmp); File.Move(tmp, outp, true); }
+        finally { if (File.Exists(tmp)) { try { File.Delete(tmp); } catch { } } }
+    }
+
+    /// <summary>Decodes a PNG just written and compares every pixel (and alpha) with what was meant to be written.</summary>
+    static void VerifyPng(string path, RgbImage img)
+    {
+        var back = Loader.LoadNonJpeg(path, out _) ?? throw new IOException("PNG verification failed: the file cannot be decoded");
+        if (back.W != img.W || back.H != img.H || !back.Rgb.AsSpan().SequenceEqual(img.Rgb)) throw new IOException("PNG verification failed: pixels differ");
+        if (img.Alpha != null && (back.Alpha == null ? img.Alpha.Any(a => a != 255) : !back.Alpha.AsSpan().SequenceEqual(img.Alpha))) throw new IOException("PNG verification failed: alpha differs");
+    }
+
+    /// <summary>An ICC profile for a grey colour space cannot describe an RGB image: libjxl refuses it and the PNG
+    /// specification forbids it. Grayscale JPEGs are decoded to three equal channels, so their profile is dropped.</summary>
+    static byte[]? IccForRgb(byte[]? icc, out string? note)
+    {
+        note = null;
+        if (icc != null && icc.Length >= 20 && icc[16] == (byte)'G' && icc[17] == (byte)'R' && icc[18] == (byte)'A' && icc[19] == (byte)'Y') { note = "grey ICC profile dropped (RGB output)"; return null; }
+        return icc;
+    }
 
     static (string route, string reason) Route(JpegInfo info, Options o, ClassResult cls, string fmt, int frames)
     {
@@ -190,51 +259,60 @@ public static class Engine
 
     static (bool, string, string?, string) WriteRestored(RgbImage img, string outBase, JpegInfo info, Options o, string what)
     {
+        // the decoders return pixels in stored order: bake the Exif orientation in and reset the tag, so JPEG XL
+        // (which follows the codestream orientation) and every PNG viewer show the image upright
+        int orient = Exif.Orientation(info.ExifTiff);
+        if (orient > 1) { img = img.Orient(orient); what += $" + orientation {orient} applied"; }
+        var exif = Exif.Normalized(info.ExifTiff);
+        var icc = IccForRgb(info.IccProfile, out string? iccNote); if (iccNote != null) what += " + " + iccNote;
+        var final = img;
         if (o.Mode == "jxl")
         {
             string outp = outBase + ".jxl";
-            var bytes = Jxl.EncodeLossless(img, info.IccProfile, info.ExifTiff, 7, o.Threads);
+            var bytes = Jxl.EncodeLossless(final, icc, exif, 7, o.Threads);
             var back = Jxl.Decode(bytes);
-            if (back == null || RgbImage.Psnr(img, back) < 120) return (false, "jxl", null, "JPEG XL lossless verification failed");
-            File.WriteAllBytes(outp, bytes);
+            if (back == null || RgbImage.Psnr(final, back) < 120) return (false, "jxl", null, "JPEG XL lossless verification failed");
+            Atomic(outp, t => File.WriteAllBytes(t, bytes));
             return (true, what + " -> jxl lossless (verified)", outp, "");
         }
-        else { string outp = outBase + ".png"; Png.Write(outp, img, info.IccProfile, info.ExifTiff); return (true, what + " -> png", outp, ""); }
+        else
+        {
+            string outp = outBase + ".png";
+            Atomic(outp, t => { Png.Write(t, final, icc, exif); VerifyPng(t, final); });
+            return (true, what + " -> png (verified)", outp, "");
+        }
     }
 
     static (bool, string, string?, string) DoLossless(string f, string outBase, Options o)
     {
+        string jm = "";
         if (o.Mode == "jxl")
         {
-            string outj = outBase + ".jxl"; string jm;
+            string outj = outBase + ".jxl";
             try
             {
                 var jpeg = File.ReadAllBytes(f);
                 var jxl = Jxl.TranscodeJpeg(jpeg, 7, o.Threads);
                 var back = Jxl.ReconstructJpeg(jxl, jpeg.Length);
-                if (back != null && back.AsSpan().SequenceEqual(jpeg)) { File.WriteAllBytes(outj, jxl); return (true, "reversible JPEG XL transcode (byte-verified)", outj, ""); }
+                if (back != null && back.AsSpan().SequenceEqual(jpeg)) { Atomic(outj, t => File.WriteAllBytes(t, jxl)); return (true, "reversible JPEG XL transcode (byte-verified)", outj, ""); }
                 jm = back == null ? "reconstruction not possible" : $"reconstruction differs ({back.Length} vs {jpeg.Length} bytes)";
                 if (Environment.GetEnvironmentVariable("RESTORE_DEBUG") == "1") File.WriteAllBytes(Path.Combine(Path.GetTempPath(), "restore_debug_transcode.jxl"), jxl);
             }
             catch (Exception ex) { jm = ex.Message; }
-            string outp = outBase + ".jpg";
-            if (Jpeg.ReencodeOptimized(f, outp, out string m)) return (true, "Huffman-optimized re-encode (coefficient-verified; JXL: " + jm + ")", outp, "");
-            if (File.Exists(outp)) File.Delete(outp);
-            return DoCopy(f, outBase, "lossless re-encode not possible (" + m + "); copied unchanged");
         }
-        else
-        {
-            string outp = outBase + ".jpg";
-            if (Jpeg.ReencodeOptimized(f, outp, out string m)) return (true, "Huffman-optimized re-encode (coefficient-verified)", outp, "");
-            if (File.Exists(outp)) File.Delete(outp);
-            return DoCopy(f, outBase, "lossless re-encode not possible (" + m + "); copied unchanged");
-        }
+        // coefficient-level re-encode through a temporary name: only a complete, verified file ever gets the final name,
+        // and nothing that this call did not create is ever deleted
+        string outp = outBase + ".jpg", tmp = outp + ".partial"; bool ok = false; string m = "";
+        try { ok = Jpeg.ReencodeOptimized(f, tmp, out m); if (ok) File.Move(tmp, outp, true); }
+        finally { if (File.Exists(tmp)) { try { File.Delete(tmp); } catch { } } }
+        if (ok) return (true, "Huffman-optimized re-encode (coefficient-verified" + (jm.Length > 0 ? "; JXL: " + jm : "") + ")", outp, "");
+        return DoCopy(f, outBase, "lossless re-encode not possible (" + m + "); copied unchanged");
     }
 
     static (bool, string, string?, string) DoCopy(string f, string outBase, string why)
     {
-        string outp = outBase + ".jpg"; File.Copy(f, outp, true);
-        if (!Hash(f).SequenceEqual(Hash(outp))) { File.Delete(outp); return (false, "copy", null, "copy verification failed (hash mismatch)"); }
+        string outp = outBase + ".jpg";
+        Atomic(outp, t => { File.Copy(f, t, true); if (!Hash(f).SequenceEqual(Hash(t))) throw new IOException("copy verification failed (hash mismatch)"); });
         return (true, "copy (verified)", outp, why);
     }
     static byte[] Hash(string p) { using var s = File.OpenRead(p); return SHA256.HashData(s); }
@@ -276,7 +354,7 @@ public static class Engine
         if (anim == null || anim.Value.frames.Count == 0) return (false, "decode", null, "could not decode the frames");
         var (frames, loop) = anim.Value; var steps = new List<string>();
         int w = frames[0].Image.W, h = frames[0].Image.H;
-        if (cls.GridK >= 2) { w = Math.Max(1, w / cls.GridK); h = Math.Max(1, h / cls.GridK); steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
+        if (cls.GridK >= 2) { var first = frames[0].Image.UndoGrid(cls.GridK, cls.GridPhaseX, cls.GridPhaseY); w = first.W; h = first.H; steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
         int factor = UpscaleFactor(o, w, h, cls.GridK);
         const long maxPixels = 250_000_000;   // all output frames in memory at once: keep it under about 1 GB
         while (factor > 1 && (long)frames.Count * w * factor * h * factor > maxPixels) factor--;
@@ -284,13 +362,19 @@ public static class Engine
         foreach (var fr in frames)
         {
             var img = fr.Image;
-            if (cls.GridK >= 2) img = img.ResamplePoint(w, h);
+            if (cls.GridK >= 2) img = img.UndoGrid(cls.GridK, cls.GridPhaseX, cls.GridPhaseY);
             if (factor > 1) img = Upscale(img, factor, o.Smooth, out how);
             outFrames.Add(img); delays.Add(fr.DelayMs);
         }
         steps.Add(how);
-        string outp = outBase + ".png"; Animation.WriteApng(outp, outFrames, delays, loop);
-        return (true, string.Join(" + ", steps) + $" -> animated png ({frames.Count} frames)", outp, $"native {w}x{h}, {frames.Count} frames");
+        string outp = outBase + ".png";
+        Atomic(outp, t =>
+        {
+            Animation.WriteApng(t, outFrames, delays, loop);
+            var back = Animation.Load(t, "png");
+            if (back == null || back.Value.frames.Count != outFrames.Count || RgbImage.Psnr(back.Value.frames[0].Image, outFrames[0]) < 120) throw new IOException("animated PNG verification failed");
+        });
+        return (true, string.Join(" + ", steps) + $" -> animated png ({frames.Count} frames, verified)", outp, $"native {w}x{h}, {frames.Count} frames");
     }
 
     static (bool, string, string?, string) DoPixelArt(string f, string outBase, JpegInfo info, ClassResult cls, Options o, RgbImage? plain)
@@ -303,14 +387,19 @@ public static class Engine
         }
         else img = plain ?? Loader.LoadNonJpeg(f, out _);
         if (img == null) return (false, "decode", null, "could not decode");
-        if (cls.GridK >= 2) { img = img.ResamplePoint(Math.Max(1, img.W / cls.GridK), Math.Max(1, img.H / cls.GridK)); steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
+        if (cls.GridK >= 2) { img = img.UndoGrid(cls.GridK, cls.GridPhaseX, cls.GridPhaseY); steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
+        int orient = info.IsJpeg ? Exif.Orientation(info.ExifTiff) : 1;
+        if (orient > 1) { img = img.Orient(orient); steps.Add($"orientation {orient} applied"); }
         if (o.Snap > 0 && info.IsJpeg) { img = Filters.MedianCut(img, o.Snap); steps.Add($"snap to {o.Snap} colours"); }
         int factor = UpscaleFactor(o, img.W, img.H, cls.GridK);
         int nw = img.W, nh = img.H;
         if (factor > 1) { img = Upscale(img, factor, o.Smooth, out string how); steps.Add(how); }
         else if (steps.Count == 0) steps.Add("native size");
-        string outp = outBase + ".png"; Png.Write(outp, img);
-        return (true, string.Join(" + ", steps) + " -> png", outp, $"native {nw}x{nh}");
+        string outp = outBase + ".png";
+        var icc = IccForRgb(info.IccProfile, out string? iccNote); if (iccNote != null) steps.Add(iccNote);
+        var exif = Exif.Normalized(info.ExifTiff); var final = img;
+        Atomic(outp, t => { Png.Write(t, final, icc, exif); VerifyPng(t, final); });
+        return (true, string.Join(" + ", steps) + " -> png (verified)", outp, $"native {nw}x{nh}");
     }
 }
 
@@ -340,7 +429,8 @@ public static class Cli
         W("Inputs are never modified. Output defaults to <input>_restored next to the input.");
         W("");
         W("Options:");
-        W("  /out X       output folder (default: <input>_restored next to the input; a last argument that does not exist yet also works)");
+        W("  /out X       output folder (default: <input>_restored next to the input). Without /out, a last argument that does not");
+        W("               exist yet, is an empty folder or holds a previous unsquish_log.csv is the output; a folder of images is an input");
         W("  /noauto      no content detection: every JPEG below /qf is treated as a photo (JPEG-only)");
         W("  /class X     force the class for every file: photo, art or pixelart (skips the classifier's verdict)");
         W("  /qf N        quality-factor threshold (default 90): restore files below N; /qf 1 = lossless for everything");
@@ -352,6 +442,7 @@ public static class Cli
         W("  /jxl /png    restored output format: lossless JPEG XL (default) or PNG; /png also makes the lossless");
         W("               branch write Huffman-optimized JPEGs instead of JPEG XL");
         W("  /threads N   CPU threads for restoration and JPEG XL encoding (default: all)");
+        W("  /cli         command-line mode even when the process owns its console (scripts, Task Scheduler); /gui forces the window");
         W("  /norecurse   do not descend into subfolders");
         W("  /overwrite   replace existing output files (default: skip them)");
         W("  /dry         show class and decision per file, write nothing");
@@ -378,6 +469,7 @@ public static class Cli
                 case "/auto": o.Auto = true; break;
                 case "/noauto": o.Auto = false; break;
                 case "/smooth": o.Smooth = true; break;
+                case "/cli": break;   // consumed in Main
                 case "/dry": o.Dry = true; break;
                 case "/features": o.Dry = true; o.Features = true; break;
                 case "/overwrite": o.Overwrite = true; break;
@@ -405,8 +497,13 @@ public static class Cli
         if (o.Qf < 1 || o.Qf > 100) { W("/qf must be 1-100", ConsoleColor.Red); exitCode = 2; return null; }
         if (o.Xbrz > 6) { W("/xbrz must be 1-6", ConsoleColor.Red); exitCode = 2; return null; }
         if (o.Snap != 0 && (o.Snap < 2 || o.Snap > 256)) { W("/snap must be 2-256 (0 = off)", ConsoleColor.Red); exitCode = 2; return null; }
-        // positional: input(s); without /out, a last positional that does not exist yet is the output folder
-        if (o.Output == null && pos.Count >= 2 && !File.Exists(pos[^1]) && !Directory.Exists(pos[^1])) { o.Output = pos[^1]; pos.RemoveAt(pos.Count - 1); }
+        // positional: input(s). Without /out, the two-argument form "input output-folder" takes the second as the output
+        // folder whether it exists yet or not, so the same command works on every run; with more inputs only a last
+        // positional that does not exist yet is taken as the output folder.
+        // An existing folder is taken as the output only when it is empty or holds a previous run's unsquish_log.csv;
+        // an existing folder of images is an input (two folders of photos are two inputs, as documented).
+        static bool OutputLike(string p) => !File.Exists(p) && (!Directory.Exists(p) || File.Exists(Path.Combine(p, "unsquish_log.csv")) || !Directory.EnumerateFileSystemEntries(p).Any());
+        if (o.Output == null && pos.Count >= 2 && OutputLike(pos[^1])) { o.Output = pos[^1]; pos.RemoveAt(pos.Count - 1); }
         o.Inputs.AddRange(pos);
         return o;
     }
@@ -415,8 +512,12 @@ public static class Cli
     {
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
         var o = Parse(args, out int code); if (o == null) return code;
-        var r = Engine.Run(o, (s, c) => W(s, c));
-        return r.Counts.TryGetValue("fail", out int fails) && fails > 0 ? 1 : 0;
+        try
+        {
+            var r = Engine.Run(o, (s, c) => W(s, c));
+            return r.Counts.TryGetValue("fail", out int fails) && fails > 0 ? 1 : 0;
+        }
+        catch (Exception ex) { W("Error: " + ex.Message, ConsoleColor.Red); return 1; }
     }
 }
 
@@ -432,7 +533,12 @@ static class Program
     static int Main(string[] args)
     {
         bool gui = args.Any(a => a.Equals("/gui", StringComparison.OrdinalIgnoreCase));
-        if (gui || OwnsConsole())
+        bool cli = args.Any(a => a.Equals("/cli", StringComparison.OrdinalIgnoreCase));
+        // The window is for double-click and drag-and-drop. A script that gives the process its own hidden console
+        // (CreateNoWindow, Task Scheduler) owns that console too, but it redirects the streams or runs without an
+        // interactive session: those stay on the command line.
+        bool own = OwnsConsole() && !Console.IsInputRedirected && !Console.IsOutputRedirected && !Console.IsErrorRedirected && Environment.UserInteractive;
+        if (gui || (own && !cli))
         {
             // The console window Windows opened for the double-click is closed again; the window takes over.
             FreeConsole();

@@ -7,12 +7,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>unsquish</AssemblyName>
     <RootNamespace>Unsquish</RootNamespace>
-    <Version>0.7.0</Version>
+    <Version>0.7.1</Version>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <UseSystemResourceKeys>true</UseSystemResourceKeys>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>

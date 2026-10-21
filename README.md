@@ -1,7 +1,7 @@
 # Unsquish
 
 Un-squishes compressed images: JPEG artifact restoration, pixel-art upscaling and verified
-lossless re-saving, in one Windows exe with a window and a command line. Version 0.7.0.
+lossless re-saving, in one Windows exe with a window and a command line. Version 0.7.1.
 
 `unsquish.exe` is the whole tool in a single Windows executable: content classification,
 JPEG restoration, pixel-art upscaling, lossless re-saving, JPEG XL output, and a window
@@ -51,19 +51,25 @@ Started from a terminal with arguments, the exe behaves as before:
 
 ```
 unsquish.exe "C:\Users\you\Pictures\holiday"            -> ...\holiday_restored
-unsquish.exe "C:\Users\you\Pictures\holiday" "E:\out"
+unsquish.exe "C:\Users\you\Pictures\holiday" "E:\out"   -> a last argument that does not exist yet, is empty or holds a previous
+                                                           unsquish_log.csv is the output folder; a folder of images is another input
 unsquish.exe a.jpg b.jpg "C:\more\pics" /out "E:\out"   -> several inputs into one folder (without /out: _restored next to the first file)
 unsquish.exe "C:\Users\you\Pictures\holiday" /dry       -> decisions only, nothing written
 unsquish.exe /?
 ```
 
-Inputs are never modified. Existing outputs are skipped unless `/overwrite`.
+Inputs are never modified. Existing outputs are skipped unless `/overwrite`. Every output is
+written under a temporary name and renamed only after it has been verified, so an interrupted
+run never leaves a half-written file under a final name. Inputs that lie inside the output
+folder are reported and skipped (compared by what the file system resolves, so a mapped or
+subst drive naming the same folder is caught too). Two inputs with the same relative name
+get distinct outputs (`name.jxl`, `name (2).jxl`).
 
 ## What it does per file
 
 | Detected | Route | Output |
 |---|---|---|
-| JPEG below the quality threshold (default 90), classed **photo** | smoothing across block seams with every DCT coefficient projected back into the interval the file allows (3 iterations), then a mild selective blur | lossless JPEG XL (`/png` for PNG), ICC and EXIF carried over |
+| JPEG below the quality threshold (default 90), classed **photo** | smoothing across block seams with every DCT coefficient projected back into the interval the file allows (3 iterations), then a mild selective blur | lossless JPEG XL (`/png` for PNG), ICC and EXIF carried over, the EXIF orientation baked into the pixels |
 | same, classed **art** (flat colour, hard lines; also photographed documents) | 4 iterations, no blur | lossless JPEG XL or PNG, ICC and EXIF carried over |
 | **pixel art** (sprites, game screens, icons, nearest-neighbour enlargements; JPEG, PNG, GIF, BMP or WebP) | restoration if JPEG, undo the enlargement, optional `/snap N` palette, crisp nearest-neighbour upscale 2x-4x (never below the undone enlargement, so the output is never smaller than the input). `/smooth` uses xBRZ instead, in passes of at most 6x. A lossless input that is already an exact integer enlargement is left alone | PNG |
 | **animated pixel art** (GIF, animated PNG or WebP whose first frame is pixel art) | the same steps on every frame | animated PNG with the original frame delays and loop count |
@@ -100,7 +106,7 @@ offset grid is now recognized as pixel art.
 
 | Option | Meaning |
 |---|---|
-| `/out X` | output folder (default: `<input>_restored` next to the input; a last argument that does not exist yet also works) |
+| `/out X` | output folder (default: `<input>_restored` next to the input). Without it, a last argument that does not exist yet, is an empty folder or holds a previous `unsquish_log.csv` is the output; an existing folder of images is an input |
 | `/noauto` | no content detection: every JPEG below `/qf` is treated as a photo, other formats ignored |
 | `/class photo|art|pixelart` | force the class for every file (the classifier still measures the pixel grid for pixel art) |
 | `/qf N` | quality-factor threshold, default 90 |
@@ -111,6 +117,7 @@ offset grid is now recognized as pixel art.
 | `/snap N` | pixel art from JPEG only: median-cut to N colours before upscaling (off by default; helps few-colour sprites, hurts rich screens) |
 | `/jxl`, `/png` | restored output format (JPEG XL default); `/png` also makes the lossless branch write Huffman-optimized JPEGs |
 | `/threads N` | CPU threads for restoration and JPEG XL encoding |
+| `/cli` | command-line mode even when the process owns its console (scripts, Task Scheduler); the window opens only for an interactive double-click or `/gui` |
 | `/norecurse`, `/overwrite`, `/dry`, `/features`, `/gui`, `/?` | as named; `/features` prints the classifier measurements per file |
 
 Exit code 0 when everything succeeded, 1 if any file failed, 2 on a usage error.
@@ -133,7 +140,8 @@ compared pixel for pixel; Huffman re-encodes are compared coefficient by coeffic
 ## Limitations
 
 - Restoration undoes the last compression generation only; re-saved or resized images gain little.
-- Grayscale JPEGs are written as RGB. CMYK and 12-bit JPEGs are copied, not restored.
+- Grayscale JPEGs are written as RGB; a grey ICC profile they carry is dropped, since it cannot
+  describe an RGB image. CMYK and 12-bit JPEGs are copied, not restored.
 - Animated inputs are processed only when they are pixel art (every frame, animated PNG out,
   all frames held in memory, so the factor is lowered for very long animations). Other
   animations are skipped. Viewers without APNG support show the first frame.

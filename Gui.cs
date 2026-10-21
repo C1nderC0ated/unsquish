@@ -148,7 +148,8 @@ sealed class MainForm : Form
             c.DragEnter += (_, e) => { if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true) e.Effect = DragDropEffects.Copy; };
             c.DragDrop += (_, e) => { if (e.Data?.GetData(DataFormats.FileDrop) is string[] paths) AddInputs(paths); };
         }
-        snap.ValueChanged += (_, _) => { if (snap.Value == 1) snap.Value = 2; };
+        decimal lastSnap = 0;   // 1 is not a valid palette size: step over it in the direction the user is going
+        snap.ValueChanged += (_, _) => { if (snap.Value == 1) snap.Value = lastSnap >= 2 ? 0 : 2; lastSnap = snap.Value; };
         reset.Click += (_, _) => { content.SelectedIndex = level.SelectedIndex = blur.SelectedIndex = xbrz.SelectedIndex = style.SelectedIndex = format.SelectedIndex = 0; snap.Value = 0; qf.Value = 90; threads.Value = Environment.ProcessorCount; };
         run.Click += (_, _) => StartRun(false);
         preview.Click += (_, _) => StartRun(true);
@@ -195,8 +196,16 @@ sealed class MainForm : Form
     {
         if (inputs.Items.Count == 0) { MessageBox.Show(this, "Add at least one file or folder first.", "Unsquish", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
         var o = Collect(dry);
-        foreach (var inp in o.Inputs) if (o.Output != null && Directory.Exists(inp) && Path.GetFullPath(o.Output).TrimEnd('\\').Equals(Path.GetFullPath(inp).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
-            { MessageBox.Show(this, "The output folder must not be an input folder.", "Unsquish", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+        if (o.Output != null)
+        {
+            // by resolved identity, so a mapped drive, subst drive or junction naming an input folder is caught too
+            var inside = o.Inputs.Where(inp => Paths.IsInside(Directory.Exists(inp) ? inp : (Path.GetDirectoryName(inp) ?? inp), o.Output)).ToList();
+            if (inside.Count > 0)
+            {
+                MessageBox.Show(this, "These inputs lie inside the output folder and would be skipped. Choose another output folder.\n\n" + string.Join("\n", inside.Take(6)) + (inside.Count > 6 ? "\n..." : ""), "Unsquish", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+        }
         SetBusy(true); log.Clear(); bar.Value = 0; bar.Maximum = 1; status.Text = dry ? "Previewing..." : "Working...";
         cts = new CancellationTokenSource(); var token = cts.Token;
         Task.Run(() =>

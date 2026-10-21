@@ -77,6 +77,56 @@ public sealed class RgbImage
         }
         return o;
     }
+    /// <summary>Undo a k x k nearest-neighbour enlargement whose cells start at (phaseX, phaseY): every cell becomes
+    /// its middle sample, partial cells at the edges included, so no interior row or column is dropped.</summary>
+    public RgbImage UndoGrid(int k, int phaseX, int phaseY)
+    {
+        var xs = CellCentres(W, k, phaseX); var ys = CellCentres(H, k, phaseY);
+        var o = new RgbImage(xs.Length, ys.Length); if (Alpha != null) o.Alpha = new byte[xs.Length * ys.Length];
+        for (int y = 0; y < ys.Length; y++)
+            for (int x = 0; x < xs.Length; x++)
+            {
+                int sp = (ys[y] * W + xs[x]) * 3, dp = (y * xs.Length + x) * 3;
+                o.Rgb[dp] = Rgb[sp]; o.Rgb[dp + 1] = Rgb[sp + 1]; o.Rgb[dp + 2] = Rgb[sp + 2];
+                if (Alpha != null) o.Alpha![y * xs.Length + x] = Alpha[ys[y] * W + xs[x]];
+            }
+        return o;
+    }
+    static int[] CellCentres(int n, int k, int phase)
+    {
+        var list = new List<int>(n / k + 2);
+        if (phase > 0) list.Add(phase / 2);                                       // partial leading cell
+        for (int s = phase; s < n; s += k) list.Add(Math.Min(n - 1, s + k / 2));   // full cells, partial trailing cell
+        return list.ToArray();
+    }
+
+    /// <summary>Applies an Exif orientation (2-8) so the pixels display upright with orientation 1.</summary>
+    public RgbImage Orient(int o)
+    {
+        if (o < 2 || o > 8) return this;
+        bool swap = o >= 5; int nw = swap ? H : W, nh = swap ? W : H;
+        var r = new RgbImage(nw, nh); if (Alpha != null) r.Alpha = new byte[nw * nh];
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+            {
+                int dx, dy;
+                switch (o)
+                {
+                    case 2: dx = W - 1 - x; dy = y; break;             // mirrored horizontally
+                    case 3: dx = W - 1 - x; dy = H - 1 - y; break;     // rotated 180
+                    case 4: dx = x; dy = H - 1 - y; break;             // mirrored vertically
+                    case 5: dx = y; dy = x; break;                     // transposed
+                    case 6: dx = H - 1 - y; dy = x; break;             // rotate 90 clockwise to display
+                    case 7: dx = H - 1 - y; dy = W - 1 - x; break;     // transversed
+                    default: dx = y; dy = W - 1 - x; break;            // 8: rotate 90 counter-clockwise to display
+                }
+                int sp = (y * W + x) * 3, dp = (dy * nw + dx) * 3;
+                r.Rgb[dp] = Rgb[sp]; r.Rgb[dp + 1] = Rgb[sp + 1]; r.Rgb[dp + 2] = Rgb[sp + 2];
+                if (Alpha != null) r.Alpha![dy * nw + dx] = Alpha[y * W + x];
+            }
+        return r;
+    }
+
     public RgbImage CenterCrop(int size)
     {
         int cw = Math.Min(W, size), ch = Math.Min(H, size);
@@ -180,6 +230,7 @@ public static class Filters
 public sealed class ClassResult
 {
     public string Class = "unknown"; public double Confidence; public double HardRatio = -1; public int GridK = 1; public double GridDb;
+    public int GridPhaseX, GridPhaseY;    // where the k x k cells start in the full image (a cropped sprite rarely starts at 0)
     public int Width, Height, Colors; public double Density = 1; public string Note = "";
     public double HardRatioNative = -1;   // same ratio measured on full-resolution crops (no point sampling)
     public double Soft = -1, Multi = -1;  // texture: tiny-difference share among differing neighbours; share of hard 3x3 windows holding 7+ colours
@@ -222,11 +273,26 @@ public static class Classifier
             // nearest-neighbour round trip (middle sample of each k x k cell) versus a smooth round trip
             // (k x k box average, then bilinear). A real pixel grid reproduces exactly under the first and
             // blurs under the second; a photo or anti-aliased drawing does not prefer the first.
-            double pn = BestPhaseNn(c, k);   // a cropped or padded sprite rarely starts on a cell boundary: try every grid phase
+            var (pn, ox, oy) = BestPhaseNn(c, k);   // a cropped or padded sprite rarely starts on a cell boundary: try every grid phase
             var bl = BoxDown(c, k).ResampleBilinear(kw, kh);
             double pb = RgbImage.Psnr(c, bl);
             double gain = pn - pb;
-            if (pn >= 28 && gain >= 3 && gain > bestGain) { bestGain = gain; res.GridK = k; res.GridDb = Math.Round(pn, 1); }
+            if (pn >= 28 && gain >= 3 && gain > bestGain)
+            {
+                bestGain = gain; res.GridK = k; res.GridDb = Math.Round(pn, 1);
+                // cells start at c*k - o inside the crop; the crop starts at ((W - cw) / 2, (H - ch) / 2) in the full image
+                int x0 = (full.W - crop.W) / 2, y0 = (full.H - crop.H) / 2;
+                res.GridPhaseX = ((x0 - ox) % k + k) % k; res.GridPhaseY = ((y0 - oy) % k + k) % k;
+            }
+        }
+        if (res.GridK >= 2 && (full.W > crop.W || full.H > crop.H))
+        {
+            // the phase decides where the undo samples: re-measure it on a larger area, so a featureless centre
+            // (sky, a flat background) does not leave the choice to a tie between phases
+            var big = full.CenterCrop(1024); int k = res.GridK;
+            var (_, ox, oy) = BestPhaseNn(CropTopLeft(big, big.W / k * k, big.H / k * k), k);
+            int bx0 = (full.W - big.W) / 2, by0 = (full.H - big.H) / 2;
+            res.GridPhaseX = ((bx0 - ox) % k + k) % k; res.GridPhaseY = ((by0 - oy) % k + k) % k;
         }
         int lng = Math.Max(res.Width, res.Height);
         (res.Soft, res.Multi) = Texture(full);
@@ -312,9 +378,9 @@ public static class Classifier
     }
     /// <summary>PSNR of the nearest-neighbour round trip (every pixel replaced by the middle sample of its k x k cell)
     /// at the best of the k*k possible grid phases.</summary>
-    static double BestPhaseNn(RgbImage c, int k)
+    static (double psnr, int ox, int oy) BestPhaseNn(RgbImage c, int k)
     {
-        int w = c.W, h = c.H; var nn = new RgbImage(w, h); var src = c.Rgb; var dst = nn.Rgb; double best = 0;
+        int w = c.W, h = c.H; var nn = new RgbImage(w, h); var src = c.Rgb; var dst = nn.Rgb; double best = 0; int bx = 0, by = 0;
         for (int oy = 0; oy < k; oy++)
             for (int ox = 0; ox < k; ox++)
             {
@@ -328,10 +394,10 @@ public static class Classifier
                         dst[d] = src[s]; dst[d + 1] = src[s + 1]; dst[d + 2] = src[s + 2];
                     }
                 }
-                double p = RgbImage.Psnr(c, nn); if (p > best) best = p;
-                if (best >= 120) return best;
+                double p = RgbImage.Psnr(c, nn); if (p > best) { best = p; bx = ox; by = oy; }
+                if (best >= 120) return (best, bx, by);
             }
-        return best;
+        return (best, bx, by);
     }
     static RgbImage BoxDown(RgbImage img, int k)
     {
