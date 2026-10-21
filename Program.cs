@@ -24,7 +24,7 @@ public sealed class RunResult { public Dictionary<string, int> Counts = new(); p
 /// <summary>Everything the tool does, driven by Options; reports through callbacks so the CLI and the window share it.</summary>
 public static class Engine
 {
-    public const string Version = "0.5.1";
+    public const string Version = "0.6.0";
 
     public static RunResult Run(Options o, Action<string, ConsoleColor?> log, Action<int, int>? progress = null, CancellationToken ct = default)
     {
@@ -84,7 +84,7 @@ public static class Engine
                 try
                 {
                     decoded = info.IsJpeg ? Jpeg.DecodePlain(f) : Loader.LoadNonJpeg(f, out frames);
-                    if (decoded != null && frames <= 1) cls = Classifier.Classify(decoded); else if (decoded == null) cls.Note = "decode failed";
+                    if (decoded != null) cls = Classifier.Classify(decoded, info.IsJpeg); else cls.Note = "decode failed";   // animations: first frame
                 }
                 catch (Exception ex) { cls.Note = "classify failed: " + ex.Message; }
                 if (o.ForceClass != null && decoded != null) { cls.Class = o.ForceClass; cls.Confidence = 1; cls.Note = "forced"; }
@@ -97,7 +97,7 @@ public static class Engine
             else if (o.Dry)
             {
                 status = "dry"; msg = reason; counts[route]++;
-                if (o.Features) log($"{rel}\t{cls.Class}\thr_proxy={cls.HardRatio.ToString(CultureInfo.InvariantCulture)}\thr_native={cls.HardRatioNative.ToString(CultureInfo.InvariantCulture)}\tdensity={cls.Density.ToString(CultureInfo.InvariantCulture)}\tgrid={cls.GridK}\t{cls.Width}x{cls.Height}\tqf={info.Qf}\t{route}", ConsoleColor.Cyan);
+                if (o.Features) log($"{rel}\t{cls.Class}\thr_proxy={cls.HardRatio.ToString(CultureInfo.InvariantCulture)}\thr_native={cls.HardRatioNative.ToString(CultureInfo.InvariantCulture)}\tdensity={cls.Density.ToString(CultureInfo.InvariantCulture)}\tsoft={cls.Soft.ToString(CultureInfo.InvariantCulture)}\tmulti={cls.Multi.ToString(CultureInfo.InvariantCulture)}\tdithered={(cls.Dithered ? 1 : 0)}\tgrid={cls.GridK}\t{cls.Width}x{cls.Height}\tqf={info.Qf}\t{route}", ConsoleColor.Cyan);
                 else log($"{tag}  would {route.ToUpperInvariant()}  ({reason})", ConsoleColor.Cyan);
             }
             else
@@ -115,7 +115,7 @@ public static class Engine
                         {
                             "restore" => DoRestore(f, outBase, effQs, effBlur, decoded, info, o),
                             "lossless" => DoLossless(f, outBase, o),
-                            "pixelart" => DoPixelArt(f, outBase, info, cls, o, decoded),
+                            "pixelart" => frames > 1 ? DoPixelArtAnimated(f, outBase, fmt, cls, o) : DoPixelArt(f, outBase, info, cls, o, decoded),
                             _ => DoCopy(f, outBase, reason),
                         };
                     }
@@ -147,7 +147,11 @@ public static class Engine
 
     static (string route, string reason) Route(JpegInfo info, Options o, ClassResult cls, string fmt, int frames)
     {
-        if (frames > 1) return ("skip", $"animated image ({frames} frames)");
+        if (frames > 1)
+        {
+            if (o.Auto && cls.Class == "pixelart") return ("pixelart", $"animated pixel art ({frames} frames): {cls.Note}");
+            return ("skip", $"animated image ({frames} frames), not pixel art" + (cls.Class != "-" ? $" ({cls.Class})" : ""));
+        }
         if (!info.IsJpeg)
         {
             if (fmt == "unknown") return ("skip", "unrecognized file format");
@@ -228,6 +232,51 @@ public static class Engine
     }
     static byte[] Hash(string p) { using var s = File.OpenRead(p); return SHA256.HashData(s); }
 
+    /// <summary>xBRZ factor for a native-size pixel image: enough for about 1024 px (2-4x), and never below the undone
+    /// nearest-neighbour factor, so the output is at least as large as the input. /xbrz N overrides.</summary>
+    static int XbrzFactor(Options o, int w, int h, int gridK) => o.Xbrz > 0 ? o.Xbrz : Math.Max(Math.Max(2, Math.Min(4, (int)Math.Ceiling(1024.0 / Math.Max(1, Math.Max(w, h))))), gridK);
+
+    /// <summary>Scales by f with xBRZ in passes of at most 6x (the scaler's limit): 8x is 4x then 2x.</summary>
+    static RgbImage XbrzScale(RgbImage img, int f, bool alpha, out string passes)
+    {
+        var parts = new List<string>();
+        while (f > 1)
+        {
+            int p = f <= 6 ? f : (f % 4 == 0 ? 4 : f % 3 == 0 ? 3 : f % 2 == 0 ? 2 : 6);
+            var dst = new Xbrz.XbrzScaler(p, alpha).ScaleImage(img.ToArgb(), null, img.W, img.H);
+            img = RgbImage.FromArgb(dst, img.W * p, img.H * p, alpha); parts.Add(p + "x");
+            f = f <= 6 ? 1 : (int)Math.Ceiling(f / (double)p);
+        }
+        passes = string.Join(" then ", parts);
+        return img;
+    }
+
+    /// <summary>Animated pixel art (GIF/PNG/WebP): every frame gets the same treatment, out comes an animated PNG with the
+    /// original delays and loop count. Palette snapping is a JPEG-only step and does not apply here.</summary>
+    static (bool, string, string?, string) DoPixelArtAnimated(string f, string outBase, string fmt, ClassResult cls, Options o)
+    {
+        var anim = Animation.Load(f, fmt);
+        if (anim == null || anim.Value.frames.Count == 0) return (false, "decode", null, "could not decode the frames");
+        var (frames, loop) = anim.Value; var steps = new List<string>();
+        int w = frames[0].Image.W, h = frames[0].Image.H;
+        if (cls.GridK >= 2) { w = Math.Max(1, w / cls.GridK); h = Math.Max(1, h / cls.GridK); steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
+        int factor = XbrzFactor(o, w, h, cls.GridK);
+        const long maxPixels = 250_000_000;   // all output frames in memory at once: keep it under about 1 GB
+        while (factor > 1 && (long)frames.Count * w * factor * h * factor > maxPixels) factor--;
+        bool alpha = frames.Any(fr => fr.Image.HasAlpha);
+        var outFrames = new List<RgbImage>(frames.Count); var delays = new List<int>(frames.Count); string passes = "";
+        foreach (var fr in frames)
+        {
+            var img = fr.Image;
+            if (cls.GridK >= 2) img = img.ResamplePoint(w, h);
+            if (factor > 1) img = XbrzScale(img, factor, alpha, out passes);
+            outFrames.Add(img); delays.Add(fr.DelayMs);
+        }
+        steps.Add(factor > 1 ? $"xBRZ {factor}x" + (passes.Contains("then") ? $" ({passes})" : "") + (alpha ? " with alpha" : "") : "native size");
+        string outp = outBase + ".png"; Animation.WriteApng(outp, outFrames, delays, loop);
+        return (true, string.Join(" + ", steps) + $" -> animated png ({frames.Count} frames)", outp, $"native {w}x{h}, {frames.Count} frames");
+    }
+
     static (bool, string, string?, string) DoPixelArt(string f, string outBase, JpegInfo info, ClassResult cls, Options o, RgbImage? plain)
     {
         var steps = new List<string>(); RgbImage? img;
@@ -240,15 +289,13 @@ public static class Engine
         if (img == null) return (false, "decode", null, "could not decode");
         if (cls.GridK >= 2) { img = img.ResamplePoint(Math.Max(1, img.W / cls.GridK), Math.Max(1, img.H / cls.GridK)); steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
         if (o.Snap > 0 && info.IsJpeg) { img = Filters.MedianCut(img, o.Snap); steps.Add($"snap to {o.Snap} colours"); }
-        int factor = Math.Max(2, Math.Min(4, (int)Math.Ceiling(1024.0 / Math.Max(1, Math.Max(img.W, img.H)))));
-        if (o.Xbrz > 0) factor = o.Xbrz;
+        int factor = XbrzFactor(o, img.W, img.H, cls.GridK);
         int nw = img.W, nh = img.H;
         if (factor > 1)
         {
             bool alpha = img.HasAlpha;
-            var scaler = new Xbrz.XbrzScaler(factor, alpha);
-            var src = img.ToArgb(); var dst = scaler.ScaleImage(src, null, img.W, img.H);
-            img = RgbImage.FromArgb(dst, img.W * factor, img.H * factor, alpha); steps.Add($"xBRZ {factor}x" + (alpha ? " with alpha" : ""));
+            img = XbrzScale(img, factor, alpha, out string passes);
+            steps.Add($"xBRZ {factor}x" + (passes.Contains("then") ? $" ({passes})" : "") + (alpha ? " with alpha" : ""));
         }
         else if (steps.Count == 0) steps.Add("native size");
         string outp = outBase + ".png"; Png.Write(outp, img);
@@ -281,6 +328,7 @@ public static class Cli
         W("Inputs are never modified. Output defaults to <input>_restored next to the input.");
         W("");
         W("Options:");
+        W("  /out X       output folder (default: <input>_restored next to the input; a last argument that does not exist yet also works)");
         W("  /noauto      no content detection: every JPEG below /qf is treated as a photo (JPEG-only)");
         W("  /class X     force the class for every file: photo, art or pixelart (skips the classifier's verdict)");
         W("  /qf N        quality-factor threshold (default 90): restore files below N; /qf 1 = lossless for everything");
@@ -320,6 +368,10 @@ public static class Cli
                 case "/features": o.Dry = true; o.Features = true; break;
                 case "/overwrite": o.Overwrite = true; break;
                 case "/norecurse": o.Recurse = false; break;
+                case "/out":
+                    i++;
+                    if (i >= args.Length) { W("/out needs a folder", ConsoleColor.Red); exitCode = 2; return null; }
+                    o.Output = args[i]; break;
                 case "/class":
                     i++;
                     if (i >= args.Length || !(args[i].ToLowerInvariant() is "photo" or "art" or "pixelart")) { W("/class needs photo, art or pixelart", ConsoleColor.Red); exitCode = 2; return null; }
@@ -339,9 +391,9 @@ public static class Cli
         if (o.Qf < 1 || o.Qf > 100) { W("/qf must be 1-100", ConsoleColor.Red); exitCode = 2; return null; }
         if (o.Xbrz > 6) { W("/xbrz must be 1-6", ConsoleColor.Red); exitCode = 2; return null; }
         if (o.Snap != 0 && (o.Snap < 2 || o.Snap > 256)) { W("/snap must be 2-256 (0 = off)", ConsoleColor.Red); exitCode = 2; return null; }
-        // positional: input(s); a second positional that does not exist yet is the output folder (classic two-argument form)
-        if (pos.Count == 2 && !File.Exists(pos[1]) && !Directory.Exists(pos[1])) { o.Inputs.Add(pos[0]); o.Output = pos[1]; }
-        else o.Inputs.AddRange(pos);
+        // positional: input(s); without /out, a last positional that does not exist yet is the output folder
+        if (o.Output == null && pos.Count >= 2 && !File.Exists(pos[^1]) && !Directory.Exists(pos[^1])) { o.Output = pos[^1]; pos.RemoveAt(pos.Count - 1); }
+        o.Inputs.AddRange(pos);
         return o;
     }
 

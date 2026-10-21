@@ -1,7 +1,7 @@
 # Unsquish
 
 Un-squishes compressed images: JPEG artifact restoration, pixel-art upscaling and verified
-lossless re-saving, in one Windows exe with a window and a command line. Version 0.5.1.
+lossless re-saving, in one Windows exe with a window and a command line. Version 0.6.0.
 
 `unsquish.exe` is the whole tool in a single Windows executable: content classification,
 JPEG restoration, pixel-art upscaling, lossless re-saving, JPEG XL output, and a window
@@ -51,7 +51,7 @@ Started from a terminal with arguments, the exe behaves as before:
 ```
 unsquish.exe "C:\Users\you\Pictures\holiday"            -> ...\holiday_restored
 unsquish.exe "C:\Users\you\Pictures\holiday" "E:\out"
-unsquish.exe a.jpg b.jpg "C:\more\pics" /class art      -> several inputs; files go to _restored next to the first file
+unsquish.exe a.jpg b.jpg "C:\more\pics" /out "E:\out"   -> several inputs into one folder (without /out: _restored next to the first file)
 unsquish.exe "C:\Users\you\Pictures\holiday" /dry       -> decisions only, nothing written
 unsquish.exe /?
 ```
@@ -64,10 +64,11 @@ Inputs are never modified. Existing outputs are skipped unless `/overwrite`.
 |---|---|---|
 | JPEG below the quality threshold (default 90), classed **photo** | smoothing across block seams with every DCT coefficient projected back into the interval the file allows (3 iterations), then a mild selective blur | lossless JPEG XL (`/png` for PNG), ICC and EXIF carried over |
 | same, classed **art** (flat colour, hard lines; also photographed documents) | 4 iterations, no blur | lossless JPEG XL or PNG, ICC and EXIF carried over |
-| **pixel art** (sprites, game screens, icons, nearest-neighbour enlargements; JPEG, PNG, GIF, BMP or WebP) | restoration if JPEG, undo the enlargement, optional `/snap N` palette, xBRZ 2x-4x | PNG |
+| **pixel art** (sprites, game screens, icons, nearest-neighbour enlargements; JPEG, PNG, GIF, BMP or WebP) | restoration if JPEG, undo the enlargement, optional `/snap N` palette, xBRZ 2x-4x (more after undoing a larger enlargement, so the output is never smaller than the input; 8x runs as 4x then 2x) | PNG |
+| **animated pixel art** (GIF, animated PNG or WebP whose first frame is pixel art) | the same steps on every frame | animated PNG with the original frame delays and loop count |
 | JPEG at or above the threshold | reversible JPEG XL transcode, verified by rebuilding the original bytes (with `/png`: Huffman-optimized JPEG, verified coefficient by coefficient) | `.jxl` (about 20 percent smaller) or `.jpg` |
 | 12-bit, CMYK, arithmetic-coded, lossless JPEG; MPF / Ultra HDR / Motion Photo (data after the end marker) | copied unchanged, hash-verified | `.jpg` |
-| PNG/GIF/BMP/WebP that are not pixel art, animated images, files of an unrecognized type | skipped, reason logged | |
+| PNG/GIF/BMP/WebP that are not pixel art (including animations of photos or drawings), files of an unrecognized type | skipped, reason logged: there is no JPEG damage in them to undo | |
 
 File types are recognized from their content, not their extension. The CSV log in the
 output folder records class, confidence, edge ratios, grid factor, quality factor, route,
@@ -79,22 +80,32 @@ action, sizes and timing per file.
   hard edges in both (large photos look hard-edged on the proxy only)
 - **colour density** (unique colours per pixel): palette images are below 2 percent
 - **pixel grid**: a nearest-neighbour round trip that beats a box-filtered one by 3 dB
-  reveals a 2x-8x nearest-neighbour enlargement, which is undone before xBRZ
+  reveals a 2x-8x nearest-neighbour enlargement, which is undone before xBRZ. Every grid
+  phase is tried, because a cropped or padded sprite rarely starts on a cell boundary.
+- **palette texture**: a GIF has at most 256 colours and dithered edges, which makes any
+  small GIF look like a sprite. A quantized soft picture gives itself away by its texture:
+  many tiny neighbour differences (adjacent palette entries), hard edges that cross seven
+  or more colours (gradients), or hardly any hard edges at all. Such files are kept out of
+  the pixel-art route. JPEG sources are exempt, since JPEG noise would trigger this on
+  genuine sprites.
 
-Calibrated on 16 test images, the 47 game screens shipped with xBRZ and a library of 100
-real images (phone photos, screenshots, drawings, memes). This version makes the same
-decisions as 0.4.0 on all 100 library images.
+Calibrated on 16 test images, the 47 game screens shipped with xBRZ, 37 dithered GIF
+renditions of photos and drawings, and a library of 111 real images (phone photos,
+screenshots, drawings, memes). Against 0.5.1 the library decisions changed for two files:
+a soft 256-px WebP is no longer treated as pixel art, and a sprite enlarged 8x with an
+offset grid is now recognized as pixel art.
 
 ## Options
 
 | Option | Meaning |
 |---|---|
+| `/out X` | output folder (default: `<input>_restored` next to the input; a last argument that does not exist yet also works) |
 | `/noauto` | no content detection: every JPEG below `/qf` is treated as a photo, other formats ignored |
 | `/class photo|art|pixelart` | force the class for every file (the classifier still measures the pixel grid for pixel art) |
 | `/qf N` | quality-factor threshold, default 90 |
 | `/qs N` | force the restoration level 0-6 (0-2: 2 iterations, 3-4: 3, 5-6: 4 with a wider smoothing scale) |
 | `/blur`, `/noblur` | force the selective-blur stage on or off |
-| `/xbrz N` | force the xBRZ factor for pixel art (1 = keep size, 2-6) |
+| `/xbrz N` | force the xBRZ factor for pixel art (1 = keep size, 2-6); default: enough for about 1024 px, at least the undone enlargement |
 | `/snap N` | pixel art from JPEG only: median-cut to N colours before xBRZ (off by default; helps few-colour sprites, hurts rich screens) |
 | `/jxl`, `/png` | restored output format (JPEG XL default); `/png` also makes the lossless branch write Huffman-optimized JPEGs |
 | `/threads N` | CPU threads for restoration and JPEG XL encoding |
@@ -121,7 +132,11 @@ compared pixel for pixel; Huffman re-encodes are compared coefficient by coeffic
 
 - Restoration undoes the last compression generation only; re-saved or resized images gain little.
 - Grayscale JPEGs are written as RGB. CMYK and 12-bit JPEGs are copied, not restored.
-- Pixel-art outputs use the first frame of animated inputs; animated images are skipped.
+- Animated inputs are processed only when they are pixel art (every frame, animated PNG out,
+  all frames held in memory, so the factor is lowered for very long animations). Other
+  animations are skipped. Viewers without APNG support show the first frame.
+- Dithered GIFs with 64 colours or fewer can still pass as pixel art; the texture test was
+  tuned on 256-colour GIFs.
 - JPEG XL viewers: Chrome 155+, Firefox 158+, IrfanView/XnView with plugin, GIMP, darktable.
   Convert any output with a JPEG XL tool if your viewer lacks support, or choose PNG.
 - Memory: about 150 MB for a 12-megapixel restoration.

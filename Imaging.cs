@@ -182,11 +182,14 @@ public sealed class ClassResult
     public string Class = "unknown"; public double Confidence; public double HardRatio = -1; public int GridK = 1; public double GridDb;
     public int Width, Height, Colors; public double Density = 1; public string Note = "";
     public double HardRatioNative = -1;   // same ratio measured on full-resolution crops (no point sampling)
+    public double Soft = -1, Multi = -1;  // texture: tiny-difference share among differing neighbours; share of hard 3x3 windows holding 7+ colours
+    public bool Dithered;                 // palette image whose texture says "quantized soft picture": kept out of the pixel-art rules
 }
 
 public static class Classifier
 {
-    public static ClassResult Classify(RgbImage full)
+    /// <param name="lossy">true for JPEG sources: their noise would make the palette-texture veto fire on genuine sprites</param>
+    public static ClassResult Classify(RgbImage full, bool lossy = false)
     {
         var res = new ClassResult { Width = full.W, Height = full.H };
         var proxy = full.PointSample(768);
@@ -214,21 +217,29 @@ public static class Classifier
         foreach (int k in new[] { 2, 3, 4, 5, 6, 8 })
         {
             int kw = crop.W / k * k, kh = crop.H / k * k;
-            if (kw < 16 || kh < 16) continue;
+            if (kw < 48 || kh < 48) continue;   // too few cells below this: the phase search would find grids in noise
             var c = CropTopLeft(crop, kw, kh);
             // nearest-neighbour round trip (middle sample of each k x k cell) versus a smooth round trip
             // (k x k box average, then bilinear). A real pixel grid reproduces exactly under the first and
             // blurs under the second; a photo or anti-aliased drawing does not prefer the first.
-            var nn = c.ResamplePoint(kw / k, kh / k).ResamplePoint(kw, kh);
+            double pn = BestPhaseNn(c, k);   // a cropped or padded sprite rarely starts on a cell boundary: try every grid phase
             var bl = BoxDown(c, k).ResampleBilinear(kw, kh);
-            double pn = RgbImage.Psnr(c, nn), pb = RgbImage.Psnr(c, bl);
+            double pb = RgbImage.Psnr(c, bl);
             double gain = pn - pb;
             if (pn >= 28 && gain >= 3 && gain > bestGain) { bestGain = gain; res.GridK = k; res.GridDb = Math.Round(pn, 1); }
         }
         int lng = Math.Max(res.Width, res.Height);
+        (res.Soft, res.Multi) = Texture(full);
+        // Palette formats make every small GIF look like a sprite (<= 256 colours, dithered hard edges). The texture of a
+        // quantized soft picture gives it away: many tiny neighbour differences (adjacent palette entries, >= 16%), or
+        // hard 3x3 windows holding 7+ colours (gradient edges, >= 45%), or hardly any hard edges at all (< 12%).
+        // The 47 xBRZ sample screens stay below 0.14 / 0.40 and above 0.16; dithered GIFs of photos and drawings land
+        // at 0.16-0.85 / 0.45-0.83. JPEG noise would trigger this on genuine sprites, so lossy sources are exempt.
+        bool paletteRule = lng <= 512 && res.Density <= 0.02 || lng <= 256 && hr >= 0.4;
+        res.Dithered = !lossy && res.GridK < 2 && paletteRule && (res.Soft >= 0.16 || res.Multi >= 0.45 || res.HardRatioNative < 0.12);
         if (res.GridK >= 2) { res.Class = "pixelart"; res.Confidence = res.GridDb >= 60 ? 0.95 : 0.8; res.Note = $"nearest-neighbour grid {res.GridK}x ({res.GridDb} dB)"; }
-        else if (lng <= 512 && res.Density <= 0.02) { res.Class = "pixelart"; res.Confidence = Math.Round(0.7 + 0.25 * Math.Min(1.0, (0.02 - res.Density) / 0.02), 2); res.Note = $"small palette image ({lng} px, {res.Colors} colours)"; }
-        else if (lng <= 256 && hr >= 0.4) { res.Class = "pixelart"; res.Confidence = Math.Round(0.6 + 0.3 * Math.Min(1.0, (hr - 0.4) / 0.6), 2); res.Note = $"small image with hard edges ({lng} px)"; }
+        else if (!res.Dithered && lng <= 512 && res.Density <= 0.02) { res.Class = "pixelart"; res.Confidence = Math.Round(0.7 + 0.25 * Math.Min(1.0, (0.02 - res.Density) / 0.02), 2); res.Note = $"small palette image ({lng} px, {res.Colors} colours)"; }
+        else if (!res.Dithered && lng <= 256 && hr >= 0.4) { res.Class = "pixelart"; res.Confidence = Math.Round(0.6 + 0.3 * Math.Min(1.0, (hr - 0.4) / 0.6), 2); res.Note = $"small image with hard edges ({lng} px)"; }
         else
         {
             // Art needs hard edges both on the proxy and at native resolution: a large photo point-sampled to the
@@ -240,8 +251,39 @@ public static class Classifier
             else if (hr < 0.3 || hn < 0.2) { res.Class = "photo"; res.Confidence = Math.Round(0.6 + 0.4 * Math.Min(1.0, (0.3 - Math.Min(hr, 0.3)) / 0.3 + (0.2 - Math.Min(hn, 0.2)) / 0.2) / 1.0, 2); res.Note = $"hard-edge ratio {res.HardRatio} (native {hn})"; }
             else { res.Class = "photo"; res.Confidence = 0.5; res.Note = $"borderline, painting-like (ratio {res.HardRatio}, native {hn})"; }
             if (res.Confidence > 1) res.Confidence = 1;
+            if (res.Dithered) res.Note += "; palette image with gradients, not pixel art";
         }
         return res;
+    }
+    /// <summary>Texture of a native-resolution centre crop (up to 512x512). soft: among neighbouring pixel pairs that
+    /// differ at all, the share that differs by at most 6 levels (adjacent entries of a palette fitted to a soft picture;
+    /// pixel-art palettes have coarser steps). multi: among 3x3 windows with a hard edge (gray range > 64), the share
+    /// holding 7 or more distinct colours (a gradient crossing the edge; a pixel-art edge is a two- or three-colour step).</summary>
+    static (double soft, double multi) Texture(RgbImage img)
+    {
+        var c = img.CenterCrop(512); int w = c.W, h = c.H; if (w < 3 || h < 3) return (0, 0);
+        var a = c.Rgb; var g = c.Gray(); long diff = 0, tiny = 0, hardWin = 0, multi7 = 0;
+        static int D(byte[] a, int p, int q) => Math.Max(Math.Abs(a[p] - a[q]), Math.Max(Math.Abs(a[p + 1] - a[q + 1]), Math.Abs(a[p + 2] - a[q + 2])));
+        var win = new int[9];
+        for (int y = 1; y < h - 1; y++)
+            for (int x = 1; x < w - 1; x++)
+            {
+                int p = (y * w + x) * 3;
+                int dr = D(a, p, p + 3), dd = D(a, p, p + w * 3);
+                if (dr > 0) { diff++; if (dr <= 6) tiny++; }
+                if (dd > 0) { diff++; if (dd <= 6) tiny++; }
+                // colours inside a hard 3x3 window: a pixel-art edge is a two- or three-colour step, a downscaled soft
+                // drawing or photo crosses an edge through a gradient of five or more distinct colours
+                int gmn = 255, gmx = 0, k = 0;
+                for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) { int i = (y + dy) * w + x + dx; int v = g[i]; if (v < gmn) gmn = v; if (v > gmx) gmx = v; win[k++] = a[i * 3] << 16 | a[i * 3 + 1] << 8 | a[i * 3 + 2]; }
+                if (gmx - gmn > 64)
+                {
+                    hardWin++; int distinct = 0;
+                    for (int i = 0; i < 9; i++) { bool seen = false; for (int j = 0; j < i; j++) if (win[j] == win[i]) { seen = true; break; } if (!seen) distinct++; }
+                    if (distinct >= 7) multi7++;
+                }
+            }
+        return (diff > 0 ? Math.Round((double)tiny / diff, 3) : 0, hardWin >= 50 ? Math.Round((double)multi7 / hardWin, 3) : 0);
     }
     /// <summary>Hard-edge ratio over up to five 256x256 full-resolution crops (centre and four quadrants).</summary>
     static double HardRatioOnCrops(RgbImage full)
@@ -267,6 +309,29 @@ public static class Classifier
                 }
         }
         return any > 0 ? (double)hard / any : 0;
+    }
+    /// <summary>PSNR of the nearest-neighbour round trip (every pixel replaced by the middle sample of its k x k cell)
+    /// at the best of the k*k possible grid phases.</summary>
+    static double BestPhaseNn(RgbImage c, int k)
+    {
+        int w = c.W, h = c.H; var nn = new RgbImage(w, h); var src = c.Rgb; var dst = nn.Rgb; double best = 0;
+        for (int oy = 0; oy < k; oy++)
+            for (int ox = 0; ox < k; ox++)
+            {
+                for (int y = 0; y < h; y++)
+                {
+                    int sy = Math.Clamp((y + oy) / k * k - oy + k / 2, 0, h - 1);
+                    for (int x = 0; x < w; x++)
+                    {
+                        int sx = Math.Clamp((x + ox) / k * k - ox + k / 2, 0, w - 1);
+                        int s = (sy * w + sx) * 3, d = (y * w + x) * 3;
+                        dst[d] = src[s]; dst[d + 1] = src[s + 1]; dst[d + 2] = src[s + 2];
+                    }
+                }
+                double p = RgbImage.Psnr(c, nn); if (p > best) best = p;
+                if (best >= 120) return best;
+            }
+        return best;
     }
     static RgbImage BoxDown(RgbImage img, int k)
     {
