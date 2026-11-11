@@ -12,20 +12,22 @@ namespace Unsquish;
 public sealed class Options
 {
     public List<string> Inputs = new(); public string? Output;
-    public bool Blur = true, Dry, Overwrite, Recurse = true, Auto = true;
+    public bool Blur, Dry, Overwrite, Recurse = true, Auto = true;
     public int Qf = 90, Qs = 4, Threads = Environment.ProcessorCount, Xbrz, Snap;
     public bool ExplicitQs, ExplicitBlur, Features;
-    public bool Smooth;                  // pixel art: xBRZ smoothing instead of the crisp nearest-neighbour upscale
-    public string Mode = "jxl";          // restored output: jxl or png
+    public bool Smooth;                  // pixel art: xBRZ smoothing instead of the crisp nearest-neighbor upscale
+    public string Mode = "jxl";          // restored output: jxl, png or jpg
+    public int JpegQuality = 95;         // quality of /jpg output
+    public bool History = true;          // look for an earlier, harsher JPEG compression in re-saved JPEGs and in bitmaps
     public string? ForceClass;           // photo | art | pixelart: skip the classifier's verdict
 }
 
-public sealed class RunResult { public Dictionary<string, int> Counts = new(); public string OutDir = ""; public double Seconds; public int Files; }
+public sealed class RunResult { public Dictionary<string, int> Counts = new(); public string OutDir = ""; public double Seconds; public int Files; public List<(string Input, string Output, string Route)> Outputs = new(); }
 
 /// <summary>Everything the tool does, driven by Options; reports through callbacks so the CLI and the window share it.</summary>
 public static class Engine
 {
-    public const string Version = "0.7.1";
+    public const string Version = "0.8.0";
 
     public static RunResult Run(Options o, Action<string, ConsoleColor?> log, Action<int, int>? progress = null, CancellationToken ct = default)
     {
@@ -35,7 +37,7 @@ public static class Engine
         // inputs: folders (recursed) and single files; relative output paths are kept per folder
         var extRe = new Regex(o.Auto ? @"^\.(jpe?g|jpe|jfif|png|gif|bmp|webp)$" : @"^\.(jpe?g|jpe|jfif)$", RegexOptions.IgnoreCase);
         var files = new List<(string path, string baseDir)>();
-        string? firstFolder = null, firstFileDir = null;
+        string? firstFolder = null, firstFileDir = null; int missing = 0;
         foreach (var inp in o.Inputs)
         {
             string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(inp));   // keeps a drive root such as E:\ intact
@@ -46,10 +48,10 @@ public static class Engine
                 foreach (var f in Directory.EnumerateFiles(full, "*", opts).Where(f => extRe.IsMatch(Path.GetExtension(f))).OrderBy(f => f, StringComparer.OrdinalIgnoreCase)) files.Add((f, full));
             }
             else if (File.Exists(full)) { firstFileDir ??= Path.GetDirectoryName(full)!; files.Add((full, Path.GetDirectoryName(full)!)); }
-            else log("Input not found: " + inp, ConsoleColor.Red);
+            else { missing++; log("Input not found: " + inp, ConsoleColor.Red); }
         }
         string outDir = Path.GetFullPath(o.Output ?? (firstFolder != null ? DefaultOut(firstFolder) : Path.Combine(firstFileDir ?? ".", "_restored")));
-        if (!o.Dry) Directory.CreateDirectory(outDir);
+        if (!o.Dry && files.Count > 0) Directory.CreateDirectory(outDir);
         // The same file given twice, and anything living inside the output folder, are not inputs. Compared by resolved
         // identity, so a mapped drive, a subst drive or a junction that names the output folder is caught as well.
         var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -70,15 +72,15 @@ public static class Engine
         log($"unsquish {Version}: {files.Count} image file(s); output -> {outDir}", ConsoleColor.White);
         if (dropped > 0) log($"  note: {dropped} input file(s) lie inside the output folder and are skipped; an output folder cannot also be an input", ConsoleColor.Yellow);
         var forced = new List<string>();
-        if (o.ExplicitQs) forced.Add("level " + o.Qs); if (o.ExplicitBlur) forced.Add("blur " + (o.Blur ? "on" : "off")); if (o.Xbrz > 0) forced.Add("scale " + o.Xbrz + "x"); if (o.Smooth) forced.Add("smooth xBRZ"); if (o.Snap > 0) forced.Add("snap " + o.Snap + " colours"); if (o.ForceClass != null) forced.Add("class " + o.ForceClass);
-        log(o.Auto ? "  auto:   photo -> level 4 + blur; art -> level 6, no blur; pixel art -> crisp upscale" + (forced.Count > 0 ? "  (forced: " + string.Join(", ", forced) + ")" : "")
+        if (o.ExplicitQs) forced.Add("level " + o.Qs); if (o.ExplicitBlur) forced.Add("blur " + (o.Blur ? "on" : "off")); if (o.Xbrz > 0) forced.Add("scale " + o.Xbrz + "x"); if (o.Smooth) forced.Add("smooth xBRZ"); if (o.Snap > 0) forced.Add("snap " + o.Snap + " colors"); if (o.ForceClass != null) forced.Add("class " + o.ForceClass);
+        log(o.Auto ? "  auto:   photo -> level 4; art -> level 6; in between -> level 4 with smoothing; pixel art -> crisp upscale" + (forced.Count > 0 ? "  (forced: " + string.Join(", ", forced) + ")" : "")
                    : $"  auto:   off (every JPEG below qf {o.Qf} is treated as a photo)", null);
         log($"  jxl:    {(Jxl.Available ? "libjxl " + Jxl.VersionString + " (bundled)" : "not available")}", null);
-        log($"  mode: {o.Mode}, level {o.Qs}, blur {(o.Blur ? "on" : "off")}, threshold qf {o.Qf}, threads {o.Threads}{(o.Dry ? ", DRY RUN" : "")}", null);
+        log($"  mode:   {o.Mode}{(o.Mode == "jpg" ? " quality " + o.JpegQuality : "")}, threshold qf {o.Qf}, earlier-compression search {(o.History ? "on" : "off")}, threads {o.Threads}{(o.Dry ? ", DRY RUN" : "")}", null);
         log("", null);
 
-        var csv = new List<string> { "\"file\",\"class\",\"confidence\",\"edge_ratio\",\"grid\",\"colors\",\"route\",\"reason\",\"qf\",\"exact_tables\",\"progressive\",\"comps\",\"action\",\"in_bytes\",\"out_bytes\",\"ms\",\"status\",\"message\"" };
-        var counts = new Dictionary<string, int> { ["restore"] = 0, ["lossless"] = 0, ["pixelart"] = 0, ["copy"] = 0, ["skip"] = 0, ["exists"] = 0, ["fail"] = 0 };
+        var csv = new List<string> { "\"file\",\"class\",\"confidence\",\"edge_ratio\",\"grid\",\"colors\",\"route\",\"reason\",\"qf\",\"exact_tables\",\"progressive\",\"comps\",\"action\",\"in_bytes\",\"out_bytes\",\"ms\",\"status\",\"message\",\"earlier_quality\"" };
+        var counts = new Dictionary<string, int> { ["restore"] = 0, ["lossless"] = 0, ["pixelart"] = 0, ["copy"] = 0, ["skip"] = 0, ["exists"] = 0, ["fail"] = missing };
         var swAll = System.Diagnostics.Stopwatch.StartNew(); int n = 0;
         var claimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // output stems written by this run
         foreach (var (f, baseDir) in files)
@@ -93,31 +95,44 @@ public static class Engine
             catch (Exception ex)
             {
                 counts["fail"]++; log($"[{n}/{files.Count}] {rel}  FAIL  read: {ex.Message}", ConsoleColor.Red);
-                csv.Add(string.Join(",", Csv(f), "-", "0", "-1", "1", "0", "-", Csv(""), "0", "False", "False", "0", Csv("read"), 0, 0, sw.ElapsedMilliseconds, "fail", Csv(ex.Message)));
+                csv.Add(string.Join(",", Csv(f), "-", "0", "-1", "1", "0", "-", Csv(""), "0", "False", "False", "0", Csv("read"), 0, 0, sw.ElapsedMilliseconds, "fail", Csv(ex.Message), 0));
                 continue;
             }
             JpegInfo info;
             if (fmt == "jpeg") { try { info = JpegProbe.Probe(f); } catch (Exception ex) { info = new JpegInfo { IsJpeg = true, Error = "probe failed: " + ex.Message }; } }
             else info = new JpegInfo { Error = fmt == "unknown" ? "unrecognized file format" : "not a JPEG" };
-            RgbImage? decoded = null; int frames = 1;
+            RgbImage? decoded = null; int frames = 1; byte[]? srcIcc = null, srcExif = null;
+            CoefImage? coefs = null; HistoryResult? hist = null;
             var cls = new ClassResult { Class = "-" };
+            // the levels and steps of a JPEG the restorers can work on are read once and serve the plain decode for the
+            // classifier, the search for an earlier compression, and the restoration itself
+            if (info.IsJpeg && info.Ok && CopyReason(info) == null) { try { coefs = CoefImage.FromJpeg(f); } catch { coefs = null; } }
             if (o.Auto && (info.IsJpeg || fmt != "unknown"))
             {
                 try
                 {
-                    decoded = info.IsJpeg ? Jpeg.DecodePlain(f) : Loader.LoadNonJpeg(f, out frames);
+                    decoded = info.IsJpeg ? (coefs != null ? Restorer.Run(coefs, Presets.Plain, out _) : Jpeg.DecodePlain(f)) : Loader.LoadNonJpeg(f, out frames, out srcIcc, out srcExif);
                     if (decoded != null) cls = Classifier.Classify(decoded, info.IsJpeg); else cls.Note = "decode failed";   // animations: first frame
                 }
                 catch (Exception ex) { cls.Note = "classify failed: " + ex.Message; }
-                if (o.ForceClass != null && decoded != null) { cls.Class = o.ForceClass; cls.Confidence = 1; cls.Note = "forced"; }
+                if (o.ForceClass != null && decoded != null) { cls.Class = o.ForceClass; cls.Confidence = 1; cls.Borderline = false; cls.Note = "forced"; }
             }
-            var (route, reason) = Route(info, o, cls, fmt, frames);
+            // an earlier, harsher compression that the file no longer declares (never looked for in pixel art)
+            if (o.History && cls.Class != "pixelart")
+            {
+                try
+                {
+                    if (coefs != null) hist = History.DetectResaved(coefs, info.Qf);
+                    else if (!info.IsJpeg && fmt != "unknown" && frames <= 1 && decoded != null) coefs = History.DetectBitmap(decoded, o.Qf - 1, out hist);
+                }
+                catch (Exception ex) { hist = new HistoryResult { Note = "history check failed: " + ex.Message }; }
+            }
+            var (route, reason) = Route(info, o, cls, fmt, frames, hist, coefs != null);
             // two inputs with the same relative name (D:\2019\IMG_0001.jpg and D:\2020\IMG_0001.jpg) must not share an output;
             // a skipped file writes nothing and claims nothing
             string wanted = outBase; int dup = 1;
             if (route != "skip") while (!claimed.Add(outBase)) outBase = $"{wanted} ({++dup})";
-            int effQs = o.Qs; bool effBlur = o.Blur;
-            if (o.Auto && cls.Class == "art") { if (!o.ExplicitQs) effQs = 6; if (!o.ExplicitBlur) effBlur = false; }
+            int effQs = o.ExplicitQs ? o.Qs : (cls.Class == "art" ? 6 : 4); bool effBlur = o.ExplicitBlur && o.Blur;
             string tag = $"[{n}/{files.Count}] {rel}" + (o.Auto && cls.Class != "-" ? $"  [{cls.Class} {cls.Confidence.ToString("0.00", CultureInfo.InvariantCulture)}]" : "");
             if (dup > 1) log($"{tag}  note: same name as an earlier input, written as {Path.GetFileName(outBase)}.*", ConsoleColor.Yellow);
             if (route == "skip") { status = "skip"; msg = reason; counts["skip"]++; log($"{tag}  SKIP  {msg}", ConsoleColor.Yellow); }
@@ -130,7 +145,11 @@ public static class Engine
             else
             {
                 // every name this route can produce (the lossless route may fall back from .jxl to .jpg)
-                string[] exts = route switch { "copy" => new[] { ".jpg" }, "lossless" => o.Mode == "jxl" ? new[] { ".jxl", ".jpg" } : new[] { ".jpg" }, "pixelart" => new[] { ".png" }, _ => new[] { o.Mode == "jxl" ? ".jxl" : ".png" } };
+                string[] exts = route switch
+                {
+                    "copy" => new[] { ".jpg" }, "lossless" => o.Mode == "jxl" ? new[] { ".jxl", ".jpg" } : new[] { ".jpg" }, "pixelart" => new[] { ".png" },
+                    _ => o.Mode == "jxl" ? new[] { ".jxl" } : o.Mode == "png" ? new[] { ".png" } : new[] { ".jpg", ".png" },   // /jpg falls back to PNG for transparency
+                };
                 string? existing = exts.Select(e => outBase + e).FirstOrDefault(File.Exists);
                 string? self = exts.Select(e => outBase + e).FirstOrDefault(p => File.Exists(p) && Paths.SameFile(f, p));
                 if (self != null) { status = "fail"; msg = "the output path is the input file itself"; counts["fail"]++; log($"{tag}  FAIL  {msg}: {self}", ConsoleColor.Red); }
@@ -143,9 +162,9 @@ public static class Engine
                         Directory.CreateDirectory(Path.GetDirectoryName(outBase)!);
                         res = route switch
                         {
-                            "restore" => DoRestore(f, outBase, effQs, effBlur, decoded, info, o),
+                            "restore" => DoRestore(f, outBase, effQs, effBlur, decoded, info, cls, coefs, srcIcc, srcExif, o),
                             "lossless" => DoLossless(f, outBase, o),
-                            "pixelart" => frames > 1 ? DoPixelArtAnimated(f, outBase, fmt, cls, o) : DoPixelArt(f, outBase, info, cls, o, decoded),
+                            "pixelart" => frames > 1 ? DoPixelArtAnimated(f, outBase, fmt, cls, o) : DoPixelArt(f, outBase, info, cls, o, decoded, coefs),
                             _ => DoCopy(f, outBase, reason),
                         };
                     }
@@ -153,14 +172,16 @@ public static class Engine
                     action = res.act; msg = res.m;
                     if (res.ok && res.outPath != null)
                     {
-                        outBytes = new FileInfo(res.outPath).Length; counts[route]++;
-                        log($"{tag}  {route.ToUpperInvariant()}  qf={info.Qf}  {action}  {inBytes / 1024}KB -> {outBytes / 1024}KB  {sw.ElapsedMilliseconds}ms", route == "restore" || route == "pixelart" ? ConsoleColor.Green : ConsoleColor.Gray);
+                        outBytes = new FileInfo(res.outPath).Length; counts[route]++; result.Outputs.Add((f, res.outPath, route));
+                        string what = info.IsJpeg ? $"qf={info.Qf}" : fmt;
+                        if (route == "restore" && hist != null && hist.Found) what += $" ({hist.Note})";
+                        log($"{tag}  {route.ToUpperInvariant()}  {what}  {action}  {inBytes / 1024}KB -> {outBytes / 1024}KB  {sw.ElapsedMilliseconds}ms", route == "restore" || route == "pixelart" ? ConsoleColor.Green : ConsoleColor.Gray);
                     }
                     else { status = "fail"; counts["fail"]++; log($"{tag}  FAIL  {action}: {msg}", ConsoleColor.Red); }
                 }
             }
             sw.Stop();
-            csv.Add(string.Join(",", Csv(f), cls.Class, cls.Confidence.ToString("0.00", CultureInfo.InvariantCulture), cls.HardRatio.ToString(CultureInfo.InvariantCulture), cls.GridK, cls.Colors, route, Csv(reason), info.Qf, info.Exact, info.Progressive, info.Comps, Csv(action), inBytes, outBytes, sw.ElapsedMilliseconds, status, Csv(msg)));
+            csv.Add(string.Join(",", Csv(f), cls.Class, cls.Confidence.ToString("0.00", CultureInfo.InvariantCulture), cls.HardRatio.ToString(CultureInfo.InvariantCulture), cls.GridK, cls.Colors, route, Csv(reason), info.Qf, info.Exact, info.Progressive, info.Comps, Csv(action), inBytes, outBytes, sw.ElapsedMilliseconds, status, Csv(msg), hist != null && hist.Found ? hist.Quality : 0));
         }
         swAll.Stop(); result.Seconds = swAll.Elapsed.TotalSeconds; result.Counts = counts;
         string? csvPath = null;
@@ -211,12 +232,25 @@ public static class Engine
     static byte[]? IccForRgb(byte[]? icc, out string? note)
     {
         note = null;
-        if (icc != null && icc.Length >= 20 && icc[16] == (byte)'G' && icc[17] == (byte)'R' && icc[18] == (byte)'A' && icc[19] == (byte)'Y') { note = "grey ICC profile dropped (RGB output)"; return null; }
+        if (icc != null && icc.Length >= 20 && icc[16] == (byte)'G' && icc[17] == (byte)'R' && icc[18] == (byte)'A' && icc[19] == (byte)'Y') { note = "gray ICC profile dropped (RGB output)"; return null; }
         return icc;
     }
 
-    static (string route, string reason) Route(JpegInfo info, Options o, ClassResult cls, string fmt, int frames)
+    /// <summary>Why a JPEG is copied instead of processed, or null when the restorers and the lossless routes can take it.</summary>
+    static string? CopyReason(JpegInfo info)
     {
+        if (info.Prec != 8) return $"{info.Prec}-bit JPEG";
+        if (info.Lossless) return "lossless JPEG (SOF3/7/11/15)";
+        if (info.Arith) return "arithmetic-coded JPEG";
+        if (info.Comps == 4) return "CMYK/4-component JPEG";
+        if (info.Mpf || info.Tail > 0 || info.Hdrgm) return $"MPF/Ultra HDR or data after EOI ({info.Tail} bytes)";
+        if (info.Tables == 0) return "no quantization tables found";
+        return null;
+    }
+
+    static (string route, string reason) Route(JpegInfo info, Options o, ClassResult cls, string fmt, int frames, HistoryResult? hist, bool haveCoefs)
+    {
+        bool earlier = hist != null && hist.Found;
         if (frames > 1)
         {
             if (o.Auto && cls.Class == "pixelart")
@@ -228,58 +262,96 @@ public static class Engine
             if (fmt == "unknown") return ("skip", "unrecognized file format");
             if (o.Auto && cls.Class == "pixelart")
                 return CleanScaled(cls, o) ? ("skip", $"clean pixel art at {cls.GridK}x integer scale, nothing to do") : ("pixelart", "pixel art: " + cls.Note);
-            return ("skip", $"{fmt} is not a JPEG, nothing to restore ({cls.Class})");
+            // a bitmap that still carries the block structure of a JPEG it was saved from
+            if (earlier && haveCoefs) return ("restore", hist!.Note + (cls.Class != "-" ? ", " + cls.Class : ""));
+            return ("skip", $"{fmt} is not a JPEG, nothing to restore ({cls.Class})" + (hist != null && hist.Note.Length > 0 ? "; " + hist.Note : ""));
         }
         if (!info.Ok) return ("skip", info.Error);
-        if (info.Prec != 8) return ("copy", $"{info.Prec}-bit JPEG");
-        if (info.Lossless) return ("copy", "lossless JPEG (SOF3/7/11/15)");
-        if (info.Arith) return ("copy", "arithmetic-coded JPEG");
-        if (info.Comps == 4) return ("copy", "CMYK/4-component JPEG");
-        if (info.Mpf || info.Tail > 0 || info.Hdrgm) return ("copy", $"MPF/Ultra HDR or data after EOI ({info.Tail} bytes)");
-        if (info.Tables == 0) return ("copy", "no quantization tables found");
+        string? copy = CopyReason(info);
+        if (copy != null) return ("copy", copy);
         if (o.Auto && cls.Class == "pixelart") return ("pixelart", $"pixel art (quality {info.Qf}): {cls.Note}");
+        string kind = o.Auto && cls.Class != "-" && cls.Class != "unknown" ? ", " + cls.Class : "";
+        // a re-saved file is judged by the harsher compression it went through, not by what its tables say now
+        if (earlier && hist!.Quality < o.Qf) return ("restore", hist.Note + kind);
         if (info.Qf >= o.Qf) return ("lossless", $"quality {info.Qf} >= {o.Qf}");
-        if (o.Auto && cls.Class != "-" && cls.Class != "unknown") return ("restore", $"quality {info.Qf} < {o.Qf}, {cls.Class}");
-        return ("restore", $"quality {info.Qf} < {o.Qf}");
+        return ("restore", $"quality {info.Qf} < {o.Qf}" + kind);
     }
 
     /// <summary>A lossless input that is already an exact integer enlargement of pixel art: the crisp default would
     /// reproduce it pixel for pixel, so it is left alone unless the user asked for a factor or for xBRZ smoothing.</summary>
     static bool CleanScaled(ClassResult cls, Options o) => cls.GridK >= 2 && !o.Smooth && o.Xbrz == 0;
 
-    static (bool, string, string?, string) DoRestore(string f, string outBase, int level, bool blur, RgbImage? plain, JpegInfo info, Options o)
+    static (bool, string, string?, string) DoRestore(string f, string outBase, int level, bool blur, RgbImage? plain, JpegInfo info, ClassResult cls, CoefImage? coefs, byte[]? srcIcc, byte[]? srcExif, Options o)
     {
-        var img = Jpeg.DecodeRestored(f, level, out var st);
-        string what;
-        if (img == null) { img = plain ?? Jpeg.DecodePlain(f); if (img == null) return (false, "decode", null, "could not decode"); what = "plain decode (unsupported colour space for restoration)"; }
-        else what = $"coefficient smoothing level {level} ({st.Iterations} it, noise {st.NoiseY.ToString(CultureInfo.InvariantCulture)})";
-        if (blur) { img = Filters.SelectiveBlur(img, 0.05); what += " + selective-blur"; }
-        return WriteRestored(img, outBase, info, o, what);
-    }
-
-    static (bool, string, string?, string) WriteRestored(RgbImage img, string outBase, JpegInfo info, Options o, string what)
-    {
-        // the decoders return pixels in stored order: bake the Exif orientation in and reset the tag, so JPEG XL
-        // (which follows the codestream orientation) and every PNG viewer show the image upright
-        int orient = Exif.Orientation(info.ExifTiff);
-        if (orient > 1) { img = img.Orient(orient); what += $" + orientation {orient} applied"; }
-        var exif = Exif.Normalized(info.ExifTiff);
-        var icc = IccForRgb(info.IccProfile, out string? iccNote); if (iccNote != null) what += " + " + iccNote;
-        var final = img;
-        if (o.Mode == "jxl")
+        RgbImage? img; string what; bool gray = false;
+        if (coefs != null)
         {
-            string outp = outBase + ".jxl";
-            var bytes = Jxl.EncodeLossless(final, icc, exif, 7, o.Threads);
-            var back = Jxl.Decode(bytes);
-            if (back == null || RgbImage.Psnr(final, back) < 120) return (false, "jxl", null, "JPEG XL lossless verification failed");
-            Atomic(outp, t => File.WriteAllBytes(t, bytes));
-            return (true, what + " -> jxl lossless (verified)", outp, "");
+            // A picture between photograph and drawing gets the drawing method at the photo level: measured, drawings
+            // the classifier takes for photographs gain 1 to 3 dB from it, and a real photograph in that band loses
+            // about 0.1 dB against the photo method while staying well above a plain decode.
+            var (rp, label) = Presets.For(cls.Class == "photo" && cls.Borderline ? "art" : cls.Class, level);
+            if (rp.ChromaOnly && coefs.Planes.Length < 3) { rp.Iterations = 0; label = label.Replace(" + luma-guided chroma", "").Split(" (")[0] + " (gray: no chroma stage)"; }
+            img = Restorer.Run(coefs, rp, out var st);
+            what = $"level {level}: {label}" + (st.Note.Length > 0 ? " (" + st.Note + ")" : "");
+            gray = coefs.Planes.Length == 1;
         }
         else
         {
+            img = plain ?? Jpeg.DecodePlain(f); if (img == null) return (false, "decode", null, "could not decode");
+            what = "plain decode (a color space the restorers do not handle)";
+        }
+        if (blur) { var alpha = img.Alpha; img = Filters.SelectiveBlur(img, 0.05); img.Alpha = alpha; what += " + selective blur"; }
+        return WriteRestored(img, outBase, info.IsJpeg ? info.IccProfile : srcIcc, info.IsJpeg ? info.ExifTiff : srcExif, o, what, gray);
+    }
+
+    /// <summary>True when both images hold exactly the same samples (and the same transparency).</summary>
+    static bool Same(RgbImage a, RgbImage? b)
+    {
+        if (b == null || a.W != b.W || a.H != b.H || !a.Rgb.AsSpan().SequenceEqual(b.Rgb)) return false;
+        if (a.Alpha == null) return b.Alpha == null || !b.Alpha.Any(v => v != 255);
+        return b.Alpha != null && a.Alpha.AsSpan().SequenceEqual(b.Alpha);
+    }
+
+    static (bool, string, string?, string) WriteRestored(RgbImage img, string outBase, byte[]? icc, byte[]? exif, Options o, string what, bool gray)
+    {
+        // the decoders return pixels in stored order: bake the Exif orientation in and reset the tag, so JPEG XL
+        // (which follows the codestream orientation) and every PNG viewer show the image upright
+        int orient = Exif.Orientation(exif);
+        if (orient > 1) { img = img.Orient(orient); what += $" + orientation {orient} applied"; }
+        exif = Exif.Normalized(exif);
+        // a profile must describe the samples that are written: grey for a grey picture, anything else for RGB
+        bool greyProfile = icc != null && icc.Length >= 20 && icc[16] == (byte)'G' && icc[17] == (byte)'R' && icc[18] == (byte)'A' && icc[19] == (byte)'Y';
+        if (icc != null && greyProfile != gray) { icc = null; what += gray ? " + color ICC profile dropped (gray output)" : " + gray ICC profile dropped (RGB output)"; }
+        var final = img; string mode = o.Mode;
+        if (mode == "jpg" && final.Alpha != null) { mode = "png"; what += " (PNG: JPEG cannot hold transparency)"; }
+        if (mode == "jxl")
+        {
+            string outp = outBase + ".jxl";
+            var bytes = Jxl.EncodeLossless(final, icc, exif, 7, o.Threads, gray);
+            if (!Same(final, Jxl.Decode(bytes))) return (false, "jxl", null, "JPEG XL lossless verification failed");
+            Atomic(outp, t => File.WriteAllBytes(t, bytes));
+            return (true, what + " -> jxl lossless (verified)", outp, "");
+        }
+        if (mode == "png")
+        {
             string outp = outBase + ".png";
-            Atomic(outp, t => { Png.Write(t, final, icc, exif); VerifyPng(t, final); });
+            Atomic(outp, t => { Png.Write(t, final, icc, exif, gray); VerifyPng(t, final); });
             return (true, what + " -> png (verified)", outp, "");
+        }
+        else
+        {
+            string outp = outBase + ".jpg"; double psnr = 0;
+            Atomic(outp, t =>
+            {
+                JpegWriter.Write(t, final, o.JpegQuality, icc, exif, gray);
+                var back = Jpeg.DecodePlain(t);
+                if (back == null || back.W != final.W || back.H != final.H) throw new IOException("JPEG verification failed: the file cannot be decoded");
+                psnr = RgbImage.Psnr(final, back);
+                // a mis-written file decodes to something unrelated (single digits); a busy picture at the lowest quality
+                // on offer still reaches the mid twenties
+                if (psnr < 16) throw new IOException("JPEG verification failed: the decoded file is far from the restored pixels");
+            });
+            return (true, what + $" -> jpeg quality {o.JpegQuality} ({psnr.ToString("0.0", CultureInfo.InvariantCulture)} dB to the restored pixels; not lossless)", outp, "");
         }
     }
 
@@ -318,14 +390,14 @@ public static class Engine
     static byte[] Hash(string p) { using var s = File.OpenRead(p); return SHA256.HashData(s); }
 
     /// <summary>Upscale factor for a native-size pixel image: enough for about 1024 px (2-4x), and never below the undone
-    /// nearest-neighbour factor, so the output is at least as large as the input. /xbrz N overrides.</summary>
+    /// nearest-neighbor factor, so the output is at least as large as the input. /xbrz N overrides.</summary>
     static int UpscaleFactor(Options o, int w, int h, int gridK) => o.Xbrz > 0 ? o.Xbrz : Math.Max(Math.Max(2, Math.Min(4, (int)Math.Ceiling(1024.0 / Math.Max(1, Math.Max(w, h))))), gridK);
 
-    /// <summary>Crisp nearest-neighbour upscale (the default: blocks stay blocks), or xBRZ smoothing with /smooth.</summary>
+    /// <summary>Crisp nearest-neighbor upscale (the default: blocks stay blocks), or xBRZ smoothing with /smooth.</summary>
     static RgbImage Upscale(RgbImage img, int f, bool smooth, out string how)
     {
         bool alpha = img.HasAlpha;
-        if (!smooth) { how = $"nearest-neighbour {f}x" + (alpha ? " with alpha" : ""); return img.ResamplePoint(img.W * f, img.H * f); }
+        if (!smooth) { how = $"nearest-neighbor {f}x" + (alpha ? " with alpha" : ""); return img.ResamplePoint(img.W * f, img.H * f); }
         var r = XbrzScale(img, f, alpha, out string passes);
         how = $"xBRZ {f}x" + (passes.Contains("then") ? $" ({passes})" : "") + (alpha ? " with alpha" : "");
         return r;
@@ -338,7 +410,7 @@ public static class Engine
         while (f > 1)
         {
             int p = f <= 6 ? f : (f % 4 == 0 ? 4 : f % 3 == 0 ? 3 : f % 2 == 0 ? 2 : 6);
-            var dst = new Xbrz.XbrzScaler(p, alpha).ScaleImage(img.ToArgb(), null, img.W, img.H);
+            var dst = new Xbrz.XbrzScaler(p, alpha).ScaleImage(img.ToArgb(), null!, img.W, img.H);
             img = RgbImage.FromArgb(dst, img.W * p, img.H * p, alpha); parts.Add(p + "x");
             f = f <= 6 ? 1 : (int)Math.Ceiling(f / (double)p);
         }
@@ -354,7 +426,7 @@ public static class Engine
         if (anim == null || anim.Value.frames.Count == 0) return (false, "decode", null, "could not decode the frames");
         var (frames, loop) = anim.Value; var steps = new List<string>();
         int w = frames[0].Image.W, h = frames[0].Image.H;
-        if (cls.GridK >= 2) { var first = frames[0].Image.UndoGrid(cls.GridK, cls.GridPhaseX, cls.GridPhaseY); w = first.W; h = first.H; steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
+        if (cls.GridK >= 2) { var first = frames[0].Image.UndoGrid(cls.GridK, cls.GridPhaseX, cls.GridPhaseY); w = first.W; h = first.H; steps.Add($"undo {cls.GridK}x nearest-neighbor"); }
         int factor = UpscaleFactor(o, w, h, cls.GridK);
         const long maxPixels = 250_000_000;   // all output frames in memory at once: keep it under about 1 GB
         while (factor > 1 && (long)frames.Count * w * factor * h * factor > maxPixels) factor--;
@@ -377,20 +449,26 @@ public static class Engine
         return (true, string.Join(" + ", steps) + $" -> animated png ({frames.Count} frames, verified)", outp, $"native {w}x{h}, {frames.Count} frames");
     }
 
-    static (bool, string, string?, string) DoPixelArt(string f, string outBase, JpegInfo info, ClassResult cls, Options o, RgbImage? plain)
+    static (bool, string, string?, string) DoPixelArt(string f, string outBase, JpegInfo info, ClassResult cls, Options o, RgbImage? plain, CoefImage? coefs)
     {
         var steps = new List<string>(); RgbImage? img;
         if (info.IsJpeg)
         {
-            if (info.Qf > 0 && info.Qf < o.Qf) { img = Jpeg.DecodeRestored(f, 4, out _) ?? plain ?? Jpeg.DecodePlain(f); steps.Add("coefficient smoothing level 4"); }
+            if (info.Qf > 0 && info.Qf < o.Qf)
+            {
+                // flat color and hard edges: the drawing preset, whose guard leaves dither patterns alone
+                int level = o.ExplicitQs ? o.Qs : 6; var rp = Presets.For("art", level).p;
+                img = (coefs != null ? Restorer.Run(coefs, rp, out _) : Jpeg.DecodeRestored(f, rp, out _)) ?? plain ?? Jpeg.DecodePlain(f);
+                steps.Add($"restoration level {level}");
+            }
             else img = plain ?? Jpeg.DecodePlain(f);
         }
         else img = plain ?? Loader.LoadNonJpeg(f, out _);
         if (img == null) return (false, "decode", null, "could not decode");
-        if (cls.GridK >= 2) { img = img.UndoGrid(cls.GridK, cls.GridPhaseX, cls.GridPhaseY); steps.Add($"undo {cls.GridK}x nearest-neighbour"); }
+        if (cls.GridK >= 2) { img = img.UndoGrid(cls.GridK, cls.GridPhaseX, cls.GridPhaseY); steps.Add($"undo {cls.GridK}x nearest-neighbor"); }
         int orient = info.IsJpeg ? Exif.Orientation(info.ExifTiff) : 1;
         if (orient > 1) { img = img.Orient(orient); steps.Add($"orientation {orient} applied"); }
-        if (o.Snap > 0 && info.IsJpeg) { img = Filters.MedianCut(img, o.Snap); steps.Add($"snap to {o.Snap} colours"); }
+        if (o.Snap > 0 && info.IsJpeg) { img = Filters.MedianCut(img, o.Snap); steps.Add($"snap to {o.Snap} colors"); }
         int factor = UpscaleFactor(o, img.W, img.H, cls.GridK);
         int nw = img.W, nh = img.H;
         if (factor > 1) { img = Upscale(img, factor, o.Smooth, out string how); steps.Add(how); }
@@ -416,16 +494,25 @@ public static class Cli
         W("       unsquish <file-or-folder> <output-folder> [options]");
         W("");
         W("Per file (auto mode, the default): classify the content, then route it.");
-        W("  - PHOTO  (soft edges, texture)      JPEG below /qf -> coefficient-constrained smoothing (level 4) + mild selective blur");
-        W("  - ART    (flat colour, hard lines)  JPEG below /qf -> coefficient-constrained smoothing (level 6), no blur");
-        W("  - PIXEL ART (1-px edges, or an exact nearest-neighbour upscale) -> restoration if JPEG, undo the");
-        W("               nearest-neighbour upscale, optional palette snap, crisp nearest-neighbour upscale to ~1024 px");
+        W("  - PHOTO  (soft edges, texture)      JPEG below /qf -> level 4: DCT denoising over all 64 block shifts,");
+        W("               then chroma smoothed along the luma edges");
+        W("  - ART    (flat color, hard lines)  JPEG below /qf -> level 6: the same denoising, then smoothing of what");
+        W("               is flat; screentone, dither and fine lines are detected and left alone. A picture between");
+        W("               the two (painting-like, shown as photo 0.50) gets this method at level 4");
+        W("  - PIXEL ART (1-px edges, or an exact nearest-neighbor upscale) -> restoration if JPEG, undo the");
+        W("               nearest-neighbor upscale, optional palette snap, crisp nearest-neighbor upscale to ~1024 px");
         W("               (xBRZ smoothing with /smooth) -> PNG; clean pixel art already at an integer scale is left alone");
         W("  - any JPEG at/above /qf -> LOSSLESS: reversible JPEG XL transcode, verified by rebuilding the original bytes");
-        W("               (with /png: same coefficients re-encoded with optimized Huffman tables, verified coefficient by coefficient)");
+        W("               (with /png or /jpg: same coefficients re-encoded with optimized Huffman tables, verified coefficient by coefficient)");
+        W("  - EARLIER COMPRESSION: a JPEG that was saved again at a higher quality, and a PNG/BMP/WebP that was a JPEG");
+        W("               once, still carry the comb of the first compression in their coefficients. When its steps are");
+        W("               established and follow a standard table, the file is restored with the bins of that compression");
         W("  - 12-bit, CMYK, arithmetic, lossless-JPEG, MPF/Ultra HDR (data after EOI) -> COPY unchanged (hash-verified)");
-        W("  - PNG/GIF/BMP/WebP inputs are only processed when they are pixel art; animated images are skipped");
-        W("Restored photos and art are written as lossless JPEG XL (ICC profile and EXIF carried over), or PNG with /png.");
+        W("  - other PNG/GIF/BMP/WebP inputs are only processed when they are pixel art (animated pixel art frame by frame)");
+        W("The restoration itself stays inside the quantization bins of the file: its result is a picture the same JPEG");
+        W("settings would have produced the same file from (the optional /blur and JPEG output come after it and are not");
+        W("bound by that). Restored pictures are written as lossless JPEG XL (ICC profile and EXIF carried over), as PNG");
+        W("with /png, or as JPEG with /jpg.");
         W("Inputs are never modified. Output defaults to <input>_restored next to the input.");
         W("");
         W("Options:");
@@ -434,20 +521,26 @@ public static class Cli
         W("  /noauto      no content detection: every JPEG below /qf is treated as a photo (JPEG-only)");
         W("  /class X     force the class for every file: photo, art or pixelart (skips the classifier's verdict)");
         W("  /qf N        quality-factor threshold (default 90): restore files below N; /qf 1 = lossless for everything");
-        W("  /qs N        force the restoration level 0-6 for every class (0-2 fast: 2 iterations; 3-4: 3; 5-6: 4)");
-        W("  /blur /noblur  force the selective-blur stage on or off for every class");
+        W("  /qs N        force the restoration level 0-6 for every class: 0-1 light smoothing (fastest), 2 denoising over");
+        W("               16 shifts, 3-6 over all 64 plus 0/30/60/100 chroma iterations (photo) or 30/60/100/150");
+        W("               smoothing iterations (art); /fast = /qs 2");
+        W("  /nohistory   do not look for an earlier compression");
+        W("  /blur        add the selective blur of versions before 0.8 after the restoration (off: it lowers measured quality)");
         W("  /xbrz N      pixel-art upscale factor (1 = keep size, 2-6; default: enough for ~1024 px, at least the undone enlargement)");
-        W("  /smooth      pixel art: xBRZ smoothing (curves instead of blocks) in place of the crisp nearest-neighbour upscale");
-        W("  /snap N      pixel art from JPEG only: snap to an N-colour palette before upscaling (off by default)");
-        W("  /jxl /png    restored output format: lossless JPEG XL (default) or PNG; /png also makes the lossless");
-        W("               branch write Huffman-optimized JPEGs instead of JPEG XL");
+        W("  /smooth      pixel art: xBRZ smoothing (curves instead of blocks) in place of the crisp nearest-neighbor upscale");
+        W("  /snap N      pixel art from JPEG only: snap to an N-color palette before upscaling (off by default)");
+        W("  /jxl /png /jpg  restored output format: lossless JPEG XL (default), PNG, or JPEG (4:4:4; small and opens");
+        W("               anywhere, but lossy again). /png and /jpg also make the lossless branch write Huffman-optimized");
+        W("               JPEGs instead of JPEG XL");
+        W("  /jpgq N      quality of /jpg output, 50-100 (default 95); implies /jpg");
         W("  /threads N   CPU threads for restoration and JPEG XL encoding (default: all)");
+        W("  /view A B    open the before / after viewer on two pictures (anything the tool reads or writes)");
         W("  /cli         command-line mode even when the process owns its console (scripts, Task Scheduler); /gui forces the window");
         W("  /norecurse   do not descend into subfolders");
         W("  /overwrite   replace existing output files (default: skip them)");
         W("  /dry         show class and decision per file, write nothing");
         W("");
-        W("The CSV log (unsquish_log.csv) records class, confidence, edge ratio and grid factor per file.");
+        W("The CSV log (unsquish_log.csv) records class, confidence, route, earlier quality and timing per file.");
     }
 
     /// <summary>Parses arguments; returns null and an exit code when the program should stop.</summary>
@@ -463,7 +556,8 @@ public static class Cli
                 case "/fast": o.Qs = 2; o.ExplicitQs = true; break;
                 case "/png": o.Mode = "png"; break;
                 case "/jxl": o.Mode = "jxl"; break;
-                case "/jpg": W("Note: /jpg (raw jpegqs JPEG output) does not exist in this edition; writing lossless JPEG XL instead.", ConsoleColor.Yellow); break;
+                case "/jpg": o.Mode = "jpg"; break;
+                case "/nohistory": o.History = false; break;
                 case "/noblur": o.Blur = false; o.ExplicitBlur = true; break;
                 case "/blur": o.Blur = true; o.ExplicitBlur = true; break;
                 case "/auto": o.Auto = true; break;
@@ -482,10 +576,10 @@ public static class Cli
                     i++;
                     if (i >= args.Length || !(args[i].ToLowerInvariant() is "photo" or "art" or "pixelart")) { W("/class needs photo, art or pixelart", ConsoleColor.Red); exitCode = 2; return null; }
                     o.ForceClass = args[i].ToLowerInvariant(); break;
-                case "/qf": case "/qs": case "/threads": case "/xbrz": case "/snap":
+                case "/qf": case "/qs": case "/threads": case "/xbrz": case "/snap": case "/jpgq":
                     i++;
                     if (i >= args.Length || !int.TryParse(args[i], out int num)) { W($"Option {a} needs a number", ConsoleColor.Red); exitCode = 2; return null; }
-                    if (l == "/qf") o.Qf = num; else if (l == "/qs") { o.Qs = num; o.ExplicitQs = true; } else if (l == "/xbrz") o.Xbrz = num; else if (l == "/snap") o.Snap = num; else o.Threads = num;
+                    if (l == "/qf") o.Qf = num; else if (l == "/qs") { o.Qs = num; o.ExplicitQs = true; } else if (l == "/xbrz") o.Xbrz = num; else if (l == "/snap") o.Snap = num; else if (l == "/jpgq") { o.JpegQuality = num; o.Mode = "jpg"; } else o.Threads = num;
                     break;
                 default:
                     if (l.StartsWith('/')) { W("Unknown option " + a, ConsoleColor.Red); Usage(); exitCode = 2; return null; }
@@ -496,6 +590,8 @@ public static class Cli
         if (o.Qs < 0 || o.Qs > 6) { W("/qs must be 0-6", ConsoleColor.Red); exitCode = 2; return null; }
         if (o.Qf < 1 || o.Qf > 100) { W("/qf must be 1-100", ConsoleColor.Red); exitCode = 2; return null; }
         if (o.Xbrz > 6) { W("/xbrz must be 1-6", ConsoleColor.Red); exitCode = 2; return null; }
+        if (o.JpegQuality < 50 || o.JpegQuality > 100) { W("/jpgq must be 50-100", ConsoleColor.Red); exitCode = 2; return null; }
+        if (o.Threads < 1) { W("/threads must be 1 or more", ConsoleColor.Red); exitCode = 2; return null; }
         if (o.Snap != 0 && (o.Snap < 2 || o.Snap > 256)) { W("/snap must be 2-256 (0 = off)", ConsoleColor.Red); exitCode = 2; return null; }
         // positional: input(s). Without /out, the two-argument form "input output-folder" takes the second as the output
         // folder whether it exists yet or not, so the same command works on every run; with more inputs only a last
@@ -532,6 +628,13 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        int view = Array.FindIndex(args, a => a.Equals("/view", StringComparison.OrdinalIgnoreCase));
+        if (view >= 0)
+        {
+            if (view + 2 >= args.Length || !File.Exists(args[view + 1]) || !File.Exists(args[view + 2])) { Console.Error.WriteLine("/view needs two existing files: the picture before and the picture after"); return 2; }
+            string before = Path.GetFullPath(args[view + 1]), after = Path.GetFullPath(args[view + 2]);
+            FreeConsole(); Gui.View(before, after); return 0;
+        }
         bool gui = args.Any(a => a.Equals("/gui", StringComparison.OrdinalIgnoreCase));
         bool cli = args.Any(a => a.Equals("/cli", StringComparison.OrdinalIgnoreCase));
         // The window is for double-click and drag-and-drop. A script that gives the process its own hidden console

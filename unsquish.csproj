@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>unsquish</AssemblyName>
     <RootNamespace>Unsquish</RootNamespace>
-    <Version>0.7.1</Version>
+    <Version>0.8.0</Version>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
@@ -22,6 +22,10 @@
     <_SuppressWinFormsTrimError>true</_SuppressWinFormsTrimError>
   </PropertyGroup>
   <ItemGroup>
+    <!-- the benchmark tool and test scripts are separate projects -->
+    <Compile Remove="tools\**" />
+  </ItemGroup>
+  <ItemGroup>
     <!-- keep the WinForms implicit usings out of the engine files (ImageSharp's Image/Color would clash); Gui.cs imports them itself -->
     <Using Remove="System.Drawing" />
     <Using Remove="System.Windows.Forms" />
@@ -30,6 +34,18 @@
     <PackageReference Include="BitMiracle.LibJpeg.NET" Version="1.5.324" />
     <PackageReference Include="XbrzSharp" Version="1.1.0" />
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.*" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- ImageSharp stays on the 3.1 line: 3.2 and 4.x need a Six Labors license key at build time. NuGet lists six
+         advisories against 3.1.12. They concern the TIFF decoder, a histogram-equalization processor and the parsing
+         of ICC profile entries. None of that code runs here: only the PNG, GIF, BMP and WebP decoders are registered
+         (Loader.Formats in Imaging.cs), no processor is called, and ICC profiles are carried as opaque bytes. -->
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-v76p-62qx-wwq2" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-wmxv-xphr-5c9g" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-j9gm-c75j-xc9q" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-jjfr-hcj7-qf5w" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-j3p4-wp97-rph4" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-gwg2-r3hj-4w44" />
   </ItemGroup>
   <ItemGroup>
     <!-- libjxl 0.12.0 runtime (BSD-3): bundled into the single file and extracted at start-up -->

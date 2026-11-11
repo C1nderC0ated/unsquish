@@ -4,3 +4,5 @@ publish/
 publish_*/
 *.user
 .vs/
+testdata/
+tools/bench/out*/

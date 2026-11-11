@@ -11,19 +11,58 @@ public static class Animation
 {
     public sealed class Frame { public RgbImage Image = null!; public int DelayMs; }
 
+    /// <summary>How often a GIF plays in total: once when it has no NETSCAPE2.0 loop block, forever (0) when the block
+    /// says 0, otherwise the block's count plus the first play. Read from the file: the decoder reports "1" both for
+    /// "no block" and for "repeat once".</summary>
+    static int GifPlays(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path); var b = new byte[(int)Math.Min(fs.Length, 4 << 20)];
+            int n = fs.ReadAtLeast(b, b.Length, false);
+            if (n < 13) return 1;
+            int p = 13; if ((b[10] & 0x80) != 0) p += 3 << ((b[10] & 7) + 1);            // global colour table
+            while (p + 1 < n)
+            {
+                if (b[p] == 0x21)                                                         // extension block
+                {
+                    bool app = b[p + 1] == 0xFF; p += 2;
+                    if (app && p + 16 < n && b[p] == 11 && b[p + 12] == 3 && b[p + 13] == 1)
+                    {
+                        string id = System.Text.Encoding.ASCII.GetString(b, p + 1, 11);
+                        if (id == "NETSCAPE2.0" || id == "ANIMEXTS1.0") { int loops = b[p + 14] | b[p + 15] << 8; return loops == 0 ? 0 : loops + 1; }
+                    }
+                    while (p < n && b[p] != 0) p += b[p] + 1;                             // its data sub-blocks
+                    p++;
+                }
+                else if (b[p] == 0x2C)                                                    // image: descriptor, colour table, data
+                {
+                    if (p + 10 >= n) break;
+                    int packed = b[p + 9]; p += 10; if ((packed & 0x80) != 0) p += 3 << ((packed & 7) + 1);
+                    p++;                                                                  // LZW code size
+                    while (p < n && b[p] != 0) p += b[p] + 1;
+                    p++;
+                }
+                else break;                                                               // trailer or damage
+            }
+        }
+        catch { }
+        return 1;
+    }
+
     /// <summary>All frames, composited by the decoder (disposal methods applied), with delays in milliseconds.
     /// loopCount 0 means repeat forever.</summary>
     public static (List<Frame> frames, int loopCount)? Load(string path, string fmt)
     {
         try
         {
-            using var im = Image.Load<Rgba32>(path);
+            using var im = Image.Load<Rgba32>(Loader.Formats, path);
             int loop = 0;
             try
             {
                 loop = fmt switch
                 {
-                    "gif" => im.Metadata.GetGifMetadata().RepeatCount,
+                    "gif" => GifPlays(path),
                     "png" => (int)im.Metadata.GetPngMetadata().RepeatCount,
                     "webp" => im.Metadata.GetWebpMetadata().RepeatCount,
                     _ => 0,

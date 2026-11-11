@@ -17,6 +17,16 @@ public static class Gui
         try { Application.SetColorMode(SystemColorMode.Dark); } catch { }
         Application.Run(new MainForm(initialInputs));
     }
+
+    /// <summary>The before / after viewer on its own, for any two pictures the tool can read.</summary>
+    public static void View(string before, string after)
+    {
+        Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        try { Application.SetColorMode(SystemColorMode.Dark); } catch { }
+        Application.Run(new CompareForm(new List<(string Input, string Output, string Route)> { (before, after, "view") }) { StartPosition = FormStartPosition.CenterScreen });
+    }
 }
 
 sealed class MainForm : Form
@@ -25,12 +35,16 @@ sealed class MainForm : Form
     readonly TextBox outBox = new() { PlaceholderText = "empty = <input>_restored next to the input" };
     readonly CheckBox recurse = new() { Text = "Include subfolders", Checked = true, AutoSize = true };
     readonly CheckBox overwrite = new() { Text = "Overwrite existing outputs", AutoSize = true };
-    readonly ComboBox content = Combo("Auto-detect: photo / art / pixel art", "Photo", "Art (anime, flat colour, scanned documents)", "Pixel art", "No detection: every JPEG is a photo");
+    readonly ComboBox content = Combo("Auto-detect: photo / art / pixel art", "Photo", "Art (anime, flat color, scanned documents)", "Pixel art", "No detection: every JPEG is a photo");
     readonly ComboBox level = Combo("Auto (photo 4, art 6)", "0 (fastest, mildest)", "1", "2 (fast)", "3", "4", "5", "6 (strongest)");
-    readonly ComboBox blur = Combo("Auto (photo on, art off)", "On", "Off");
+    readonly ComboBox blur = Combo("Off", "On");
     readonly ComboBox xbrz = Combo("Auto (up to ~1024 px)", "Keep size (no upscale)", "2x", "3x", "4x", "5x", "6x");
-    readonly ComboBox style = Combo("Crisp (nearest-neighbour)", "Smooth (xBRZ)");
-    readonly ComboBox format = Combo("JPEG XL (lossless, ~20% smaller)", "PNG (opens anywhere)");
+    readonly ComboBox style = Combo("Crisp (nearest-neighbor)", "Smooth (xBRZ)");
+    readonly ComboBox format = Combo("JPEG XL (lossless, smallest)", "PNG (lossless, opens anywhere)", "JPEG quality 95 (small, opens anywhere)");
+    readonly CheckBox history = new() { Text = "Find earlier compression", Checked = true, AutoSize = true };
+    readonly Button compare = new() { Text = "Compare before / after", AutoSize = true, Enabled = false };
+    List<(string Input, string Output, string Route)> lastOutputs = new();
+    readonly List<CompareForm> viewers = new();
     readonly NumericUpDown snap = new() { Minimum = 0, Maximum = 256, Value = 0, Width = 70 };
     readonly NumericUpDown qf = new() { Minimum = 1, Maximum = 100, Value = 90, Width = 70 };
     readonly NumericUpDown threads = new() { Minimum = 1, Maximum = 256, Value = Environment.ProcessorCount, Width = 70 };
@@ -76,8 +90,8 @@ sealed class MainForm : Form
         outTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); outTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); outTable.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         outTable.Controls.Add(new Label { Text = "Output folder:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
         outBox.Dock = DockStyle.Fill; outTable.Controls.Add(outBox, 1, 0); outTable.Controls.Add(browseOut, 2, 0);
-        var outFlags = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight };
-        outFlags.Controls.Add(recurse); outFlags.Controls.Add(overwrite);
+        var outFlags = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, FlowDirection = FlowDirection.LeftToRight };
+        outFlags.Controls.Add(recurse); outFlags.Controls.Add(overwrite); outFlags.Controls.Add(history);
         outTable.Controls.Add(outFlags, 1, 1); outTable.SetColumnSpan(outFlags, 2);
         root.Controls.Add(outTable, 0, 1);
 
@@ -94,26 +108,28 @@ sealed class MainForm : Form
         Row(0, "Content:", content, "Output format:", format);
         Row(1, "Restoration level:", level, "Restore JPEGs below quality:", qf);
         Row(2, "Selective blur:", blur, "Pixel-art upscale:", xbrz);
-        Row(3, "Palette snap, colours (0 = off):", snap, "Threads:", threads);
+        Row(3, "Palette snap, colors (0 = off):", snap, "Threads:", threads);
         grid.Controls.Add(new Label { Text = "Pixel-art style:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 4); grid.Controls.Add(style, 1, 4);
         grid.Controls.Add(reset, 3, 4); reset.Anchor = AnchorStyles.Right;
         setGroup.Controls.Add(grid); root.Controls.Add(setGroup, 0, 2);
         var tips = new ToolTip { AutoPopDelay = 15000, InitialDelay = 400 };
-        tips.SetToolTip(content, "Auto-detect looks at edges, colour count and pixel grids. Force a type when the log shows a wrong class.");
-        tips.SetToolTip(level, "0-2: fast and mild (2 iterations). 3-4: default (3). 5-6: strongest, for heavily crushed files (4).");
-        tips.SetToolTip(blur, "A mild selective blur after restoration. Good for photos, bad for line art.");
+        tips.SetToolTip(content, "Auto-detect looks at edges, color count and pixel grids. Force a type when the log shows a wrong class.");
+        tips.SetToolTip(level, "0-1: light smoothing, fastest. 2: quick denoising. 3-6: full denoising; each step up spends more time on chroma (photos) or on flattening flat color (art). Auto uses 4 for photos and 6 for art.");
+        tips.SetToolTip(blur, "The selective blur that versions before 0.8 applied to photos after restoration. Off by default: it lowers measured quality. Bad for line art.");
         tips.SetToolTip(xbrz, "Upscale factor for pixel art. Auto is enough for about 1024 px and never below an undone enlargement. Keep size writes it at native resolution.");
         tips.SetToolTip(style, "Crisp keeps every pixel a block (the pixel-art look). Smooth redraws stair-steps as curves with xBRZ, the emulator-filter look. Clean pixel art that is already at an integer scale is left alone on Crisp.");
-        tips.SetToolTip(snap, "Pixel art that came from a JPEG: snap to this many colours before upscaling. Helps few-colour sprites, hurts busy scenes.");
+        tips.SetToolTip(snap, "Pixel art that came from a JPEG: snap to this many colors before upscaling. Helps few-color sprites, hurts busy scenes.");
         tips.SetToolTip(qf, "JPEGs below this quality factor are restored; files at or above it are re-saved losslessly. 1 = lossless for everything.");
-        tips.SetToolTip(format, "JPEG XL files are about 20% smaller than the JPEG and losslessly hold the restored pixels. PNG opens anywhere.");
+        tips.SetToolTip(format, "JPEG XL holds the restored pixels losslessly in the smallest file. PNG is lossless and opens anywhere. JPEG at quality 95 is small and opens anywhere, but compresses once more.");
+        tips.SetToolTip(history, "Recognizes JPEGs that were saved again at a higher quality, and PNG / BMP / WebP files that were JPEGs once, and restores them with the settings of that earlier compression. Only when the traces are certain.");
+        tips.SetToolTip(compare, "Opens a viewer on the files of the last run: the original left of the line, the result right of it.");
         tips.SetToolTip(threads, "CPU threads for restoration and JPEG XL encoding.");
         tips.SetToolTip(overwrite, "By default existing output files are left alone and reported as EXISTS.");
 
         // --- buttons
         var btnRow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0, 8, 0, 0) };
         run.Font = new Font(Font, FontStyle.Bold);
-        foreach (var b in new[] { run, preview, cancel, openOut, guide }) { b.Padding = new Padding(6, 2, 6, 2); btnRow.Controls.Add(b); }
+        foreach (var b in new[] { run, preview, cancel, openOut, compare, guide }) { b.Padding = new Padding(6, 2, 6, 2); btnRow.Controls.Add(b); }
         root.Controls.Add(btnRow, 0, 3);
 
         // --- progress
@@ -150,12 +166,17 @@ sealed class MainForm : Form
         }
         decimal lastSnap = 0;   // 1 is not a valid palette size: step over it in the direction the user is going
         snap.ValueChanged += (_, _) => { if (snap.Value == 1) snap.Value = lastSnap >= 2 ? 0 : 2; lastSnap = snap.Value; };
-        reset.Click += (_, _) => { content.SelectedIndex = level.SelectedIndex = blur.SelectedIndex = xbrz.SelectedIndex = style.SelectedIndex = format.SelectedIndex = 0; snap.Value = 0; qf.Value = 90; threads.Value = Environment.ProcessorCount; };
+        reset.Click += (_, _) => { content.SelectedIndex = level.SelectedIndex = blur.SelectedIndex = xbrz.SelectedIndex = style.SelectedIndex = format.SelectedIndex = 0; snap.Value = 0; qf.Value = 90; threads.Value = Environment.ProcessorCount; history.Checked = true; };
         run.Click += (_, _) => StartRun(false);
         preview.Click += (_, _) => StartRun(true);
         cancel.Click += (_, _) => { cts?.Cancel(); status.Text = "Cancelling after the current file..."; cancel.Enabled = false; };
         openOut.Click += (_, _) => { if (lastOut != null && Directory.Exists(lastOut)) Process.Start(new ProcessStartInfo("explorer.exe", "\"" + lastOut + "\"") { UseShellExecute = true }); };
         guide.Click += (_, _) => ShowGuide();
+        compare.Click += (_, _) =>
+        {
+            if (lastOutputs.Count == 0) return;
+            var v = new CompareForm(lastOutputs); viewers.Add(v); v.FormClosed += (_, _) => viewers.Remove(v); v.Show(this);
+        };
         FormClosing += (_, e) =>
         {
             SaveSettings();
@@ -181,12 +202,12 @@ sealed class MainForm : Form
 
     Options Collect(bool dry)
     {
-        var o = new Options { Dry = dry, Recurse = recurse.Checked, Overwrite = overwrite.Checked, Qf = (int)qf.Value, Threads = (int)threads.Value, Snap = (int)snap.Value, Mode = format.SelectedIndex == 1 ? "png" : "jxl" };
+        var o = new Options { Dry = dry, Recurse = recurse.Checked, Overwrite = overwrite.Checked, Qf = (int)qf.Value, Threads = (int)threads.Value, Snap = (int)snap.Value, Mode = format.SelectedIndex == 1 ? "png" : format.SelectedIndex == 2 ? "jpg" : "jxl", History = history.Checked };
         o.Inputs.AddRange(inputs.Items.Cast<string>());
         if (!string.IsNullOrWhiteSpace(outBox.Text)) o.Output = outBox.Text.Trim();
         switch (content.SelectedIndex) { case 1: o.ForceClass = "photo"; break; case 2: o.ForceClass = "art"; break; case 3: o.ForceClass = "pixelart"; break; case 4: o.Auto = false; break; }
         if (level.SelectedIndex > 0) { o.Qs = level.SelectedIndex - 1; o.ExplicitQs = true; }
-        if (blur.SelectedIndex > 0) { o.Blur = blur.SelectedIndex == 1; o.ExplicitBlur = true; }
+        if (blur.SelectedIndex == 1) { o.Blur = true; o.ExplicitBlur = true; }
         if (xbrz.SelectedIndex > 0) o.Xbrz = xbrz.SelectedIndex;   // 1 = keep size, 2..6 = factor
         o.Smooth = style.SelectedIndex == 1;
         return o;
@@ -206,6 +227,7 @@ sealed class MainForm : Form
                 return;
             }
         }
+        if (!dry) foreach (var v in viewers.ToArray()) v.Close();   // a viewer still reading an output would make replacing it fail
         SetBusy(true); log.Clear(); bar.Value = 0; bar.Maximum = 1; status.Text = dry ? "Previewing..." : "Working...";
         cts = new CancellationTokenSource(); var token = cts.Token;
         Task.Run(() =>
@@ -220,6 +242,7 @@ sealed class MainForm : Form
                 else if (r != null)
                 {
                     bar.Value = bar.Maximum; lastOut = r.OutDir; openOut.Enabled = !dry && Directory.Exists(lastOut);
+                    if (!dry) { lastOutputs = r.Outputs; compare.Enabled = lastOutputs.Count > 0; }
                     int fails = r.Counts.GetValueOrDefault("fail");
                     status.Text = token.IsCancellationRequested ? "Cancelled." : dry ? "Preview finished, nothing was written. Click Restore to run it." : (fails > 0 ? $"Finished with {fails} failure(s), see the log." : $"Finished in {r.Seconds.ToString("n1", CultureInfo.InvariantCulture)} s. Output: {r.OutDir}");
                 }
@@ -230,8 +253,8 @@ sealed class MainForm : Form
 
     void SetBusy(bool busy)
     {
-        foreach (Control c in new Control[] { addFiles, addFolder, remove, clear, browseOut, recurse, overwrite, content, level, blur, xbrz, style, format, snap, qf, threads, reset, run, preview, outBox }) c.Enabled = !busy;
-        cancel.Enabled = busy; UseWaitCursor = busy;
+        foreach (Control c in new Control[] { addFiles, addFolder, remove, clear, browseOut, recurse, overwrite, history, content, level, blur, xbrz, style, format, snap, qf, threads, reset, run, preview, outBox }) c.Enabled = !busy;
+        cancel.Enabled = busy; UseWaitCursor = busy; compare.Enabled = !busy && lastOutputs.Count > 0;
     }
 
     static Color Map(ConsoleColor? c) => c switch
@@ -250,28 +273,39 @@ sealed class MainForm : Form
     {
         const string text =
             "WHAT HAPPENS TO EACH FILE (Auto)\r\n" +
-            "  Photo (soft edges, texture)            JPEG below the quality threshold: coefficient-constrained smoothing level 4 + mild selective blur\r\n" +
-            "  Art (anime, flat colour, documents)    JPEG below the threshold: smoothing level 6, no blur (blur would soften line work)\r\n" +
-            "  Pixel art (1-px edges or an exact NN   restoration if JPEG, undo the nearest-neighbour enlargement, optional palette snap,\r\n" +
-            "            enlargement)                 crisp nearest-neighbour upscale to about 1024 px -> PNG (transparency kept).\r\n" +
+            "  Photo (soft edges, texture)            JPEG below the quality threshold: level 4. The picture is denoised in the DCT domain over\r\n" +
+            "                                         all 64 block positions, then chroma is smoothed along the luma edges.\r\n" +
+            "  Art (anime, flat color, documents)    JPEG below the threshold: level 6. The same denoising, then everything flat is smoothed;\r\n" +
+            "                                         screentone, dither and fine lines are detected and left alone.\r\n" +
+            "  In between (painting-like, photo 0.50) the art method at level 4.\r\n" +
+            "  Pixel art (1-px edges or an exact NN   restoration if JPEG, undo the nearest-neighbor enlargement, optional palette snap,\r\n" +
+            "            enlargement)                 crisp nearest-neighbor upscale to about 1024 px -> PNG (transparency kept).\r\n" +
             "                                         Clean pixel art already at an integer scale is left alone.\r\n" +
             "  Animated pixel art (GIF/PNG/WebP)      the same for every frame -> animated PNG with the original timing\r\n" +
             "  Any JPEG at/above the threshold        re-saved losslessly: reversible JPEG XL (about 20% smaller), verified by rebuilding the\r\n" +
-            "                                         original bytes; with PNG output: same JPEG with optimized Huffman tables\r\n" +
+            "                                         original bytes; with PNG or JPEG output: same JPEG with optimized Huffman tables\r\n" +
+            "  Saved again, or saved as PNG           a JPEG re-saved at a higher quality, and a PNG / BMP / WebP that was a JPEG once, still\r\n" +
+            "                                         show the first compression in their coefficients. When that is certain, the file is\r\n" +
+            "                                         restored with the settings of that first compression (Find earlier compression).\r\n" +
             "  12-bit, CMYK, arithmetic, lossless JPEG, MPF / Ultra HDR   copied unchanged (hash-verified)\r\n" +
-            "  PNG / GIF / BMP / WebP                 only processed when they are pixel art; animations are skipped\r\n" +
+            "  Other PNG / GIF / BMP / WebP           only processed when they are pixel art; other animations are skipped\r\n" +
+            "\r\n" +
+            "The restoration itself stays inside what the file allows: its result is a picture that the same JPEG settings would\r\n" +
+            "turn into the same file. The optional blur and JPEG output come after it and are not bound by that.\r\n" +
             "\r\n" +
             "RECOMMENDATIONS\r\n" +
             "  Mixed folder, phone photos, screenshots   Auto. Check the class in the log; the CSV log has the confidence.\r\n" +
-            "  Anime / illustrations detected as photo   Content = Art. Level 6 without blur keeps line work crisp.\r\n" +
-            "  Very crushed photos (quality < 50)        Level 5 or 6 removes more blocking; level 2 is fast and mild.\r\n" +
-            "  Portraits with fine skin texture          Blur = Off if the result looks waxy.\r\n" +
-            "  Pixel art / sprites / game screenshots    Auto. Palette snap only for sprites with few colours (it hurts busy scenes).\r\n" +
+            "  Anime / illustrations detected as photo   Content = Art: flat color becomes flat again and edges clean.\r\n" +
+            "  Large batches, slow computer              Level 2 or 3: most of the gain for photos at a fraction of the time.\r\n" +
+            "  Drawings with soft pencil or paint        Level 3 or 4 if level 6 looks too clean.\r\n" +
+            "  Pixel art / sprites / game screenshots    Auto. Palette snap only for sprites with few colors (it hurts busy scenes).\r\n" +
             "  Keep pixel art at native size             Pixel-art upscale = Keep size.\r\n" +
             "  Smooth, emulator-filter look              Pixel-art style = Smooth (xBRZ redraws the stair-steps as curves).\r\n" +
             "  Already good JPEGs (quality >= 90)        nothing is restored; they are re-saved losslessly. Raise the threshold to\r\n" +
             "                                            restore more files, lower it (e.g. 1) to make everything lossless.\r\n" +
-            "  Viewer cannot open .jxl                   Output format = PNG (larger files; lossless JPEGs stay .jpg).\r\n" +
+            "  Viewer cannot open .jxl                   Output format = PNG (lossless, large) or JPEG quality 95 (small).\r\n" +
+            "  See what changed                          Compare before / after, after a run: slide the line with the mouse, wheel to zoom,\r\n" +
+            "                                            drag to pan, B / A show one side only.\r\n" +
             "\r\n" +
             "Preview runs the detection and shows the decision per file without writing anything.\r\n" +
             "Inputs are never modified. Outputs keep the folder structure, the ICC profile and EXIF.\r\n" +
@@ -287,7 +321,7 @@ sealed class MainForm : Form
         {
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllLines(SettingsPath, new[] { $"content={content.SelectedIndex}", $"level={level.SelectedIndex}", $"blur={blur.SelectedIndex}", $"xbrz={xbrz.SelectedIndex}", $"style={style.SelectedIndex}", $"format={format.SelectedIndex}",
-                $"snap={snap.Value}", $"qf={qf.Value}", $"threads={threads.Value}", $"recurse={recurse.Checked}", $"overwrite={overwrite.Checked}", $"width={Width}", $"height={Height}" });
+                $"snap={snap.Value}", $"qf={qf.Value}", $"threads={threads.Value}", $"recurse={recurse.Checked}", $"overwrite={overwrite.Checked}", $"history={history.Checked}", $"width={Width}", $"height={Height}" });
         }
         catch { }
     }
@@ -302,7 +336,7 @@ sealed class MainForm : Form
             void Num(NumericUpDown n, string k) { if (kv.TryGetValue(k, out var v) && decimal.TryParse(v, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) && d >= n.Minimum && d <= n.Maximum) n.Value = d; }
             Sel(content, "content"); Sel(level, "level"); Sel(blur, "blur"); Sel(xbrz, "xbrz"); Sel(style, "style"); Sel(format, "format");
             Num(snap, "snap"); Num(qf, "qf"); Num(threads, "threads");
-            if (kv.TryGetValue("recurse", out var r)) recurse.Checked = r == "True"; if (kv.TryGetValue("overwrite", out var ow)) overwrite.Checked = ow == "True";
+            if (kv.TryGetValue("recurse", out var r)) recurse.Checked = r == "True"; if (kv.TryGetValue("overwrite", out var ow)) overwrite.Checked = ow == "True"; if (kv.TryGetValue("history", out var hs)) history.Checked = hs == "True";
             if (kv.TryGetValue("width", out var w) && kv.TryGetValue("height", out var h) && int.TryParse(w, out int wi) && int.TryParse(h, out int hi) && wi >= MinimumSize.Width && hi >= MinimumSize.Height) Size = new Size(wi, hi);
         }
         catch { }

@@ -105,20 +105,32 @@ public static unsafe class Jxl
     }
 
     /// <summary>Pixel-lossless JPEG XL of an 8-bit RGB image, with optional ICC profile and EXIF (TIFF payload).</summary>
-    public static byte[] EncodeLossless(RgbImage img, byte[]? icc, byte[]? exif, int effort, int threads)
+    public static byte[] EncodeLossless(RgbImage img, byte[]? icc, byte[]? exif, int effort, int threads, bool gray = false)
     {
+        bool alpha = img.Alpha != null; int colour = gray ? 1 : 3, channels = colour + (alpha ? 1 : 0);
+        byte[] pixels = img.Rgb;
+        if (channels != 3)
+        {
+            // one grey sample instead of three equal ones, and straight alpha as the last sample
+            int count = img.W * img.H; pixels = new byte[(long)count * channels];
+            for (int i = 0, s = 0, d = 0; i < count; i++, s += 3)
+            {
+                pixels[d++] = img.Rgb[s]; if (!gray) { pixels[d++] = img.Rgb[s + 1]; pixels[d++] = img.Rgb[s + 2]; }
+                if (alpha) pixels[d++] = img.Alpha![i];
+            }
+        }
         IntPtr enc = JxlEncoderCreate(IntPtr.Zero); IntPtr runner = IntPtr.Zero;
         try
         {
             if (runnerFn != IntPtr.Zero) { runner = JxlThreadParallelRunnerCreate(IntPtr.Zero, (nuint)Math.Max(1, threads)); JxlEncoderSetParallelRunner(enc, runnerFn, runner); }
             var info = new BasicInfo(); JxlEncoderInitBasicInfo(&info);
             info.xsize = (uint)img.W; info.ysize = (uint)img.H; info.bits_per_sample = 8; info.exponent_bits_per_sample = 0;
-            info.uses_original_profile = 1; info.num_color_channels = 3; info.alpha_bits = 0; info.num_extra_channels = 0;
+            info.uses_original_profile = 1; info.num_color_channels = (uint)colour; info.alpha_bits = alpha ? 8u : 0u; info.num_extra_channels = alpha ? 1u : 0u;
             bool boxes = exif != null && exif.Length > 0;
             if (boxes) { Check(JxlEncoderUseContainer(enc, 1), "UseContainer"); }
             Check(JxlEncoderSetBasicInfo(enc, &info), "SetBasicInfo");
             if (icc != null && icc.Length > 0) { fixed (byte* p = icc) Check(JxlEncoderSetICCProfile(enc, p, (nuint)icc.Length), "SetICCProfile"); }
-            else { var ce = new ColorEncoding(); JxlColorEncodingSetToSRGB(&ce, 0); Check(JxlEncoderSetColorEncoding(enc, &ce), "SetColorEncoding"); }
+            else { var ce = new ColorEncoding(); JxlColorEncodingSetToSRGB(&ce, gray ? 1 : 0); Check(JxlEncoderSetColorEncoding(enc, &ce), "SetColorEncoding"); }
             if (boxes)
             {
                 Check(JxlEncoderUseBoxes(enc), "UseBoxes");
@@ -130,8 +142,8 @@ public static unsafe class Jxl
             IntPtr fs = JxlEncoderFrameSettingsCreate(enc, IntPtr.Zero);
             Check(JxlEncoderSetFrameLossless(fs, 1), "SetFrameLossless");
             Check(JxlEncoderFrameSettingsSetOption(fs, 0 /* EFFORT */, Math.Clamp(effort, 1, 9)), "SetOption effort");
-            var pf = new PixelFormat { num_channels = 3, data_type = 2 /* UINT8 */, endianness = 0, align = 0 };
-            fixed (byte* p = img.Rgb) Check(JxlEncoderAddImageFrame(fs, &pf, p, (nuint)img.Rgb.Length), "AddImageFrame");
+            var pf = new PixelFormat { num_channels = (uint)channels, data_type = 2 /* UINT8 */, endianness = 0, align = 0 };
+            fixed (byte* p = pixels) Check(JxlEncoderAddImageFrame(fs, &pf, p, (nuint)pixels.Length), "AddImageFrame");
             JxlEncoderCloseInput(enc);
             return Collect(enc);
         }
@@ -200,18 +212,30 @@ public static unsafe class Jxl
             if (JxlDecoderSetInput(dec, (byte*)hIn.AddrOfPinnedObject(), (nuint)jxl.Length) != DEC_SUCCESS) return null;
             JxlDecoderCloseInput(dec);
             var pf = new PixelFormat { num_channels = 3, data_type = 2, endianness = 0, align = 0 };
-            while (true)
+            byte[]? rgba = null; bool done = false;
+            while (!done)
             {
                 int st = JxlDecoderProcessInput(dec);
-                if (st == DEC_BASIC_INFO) { var bi = new BasicInfo(); if (JxlDecoderGetBasicInfo(dec, &bi) != DEC_SUCCESS) return null; img = new RgbImage((int)bi.xsize, (int)bi.ysize); }
+                if (st == DEC_BASIC_INFO)
+                {
+                    var bi = new BasicInfo(); if (JxlDecoderGetBasicInfo(dec, &bi) != DEC_SUCCESS) return null;
+                    img = new RgbImage((int)bi.xsize, (int)bi.ysize);
+                    if (bi.alpha_bits > 0) { pf.num_channels = 4; rgba = new byte[(long)img.W * img.H * 4]; }   // grey comes back as three equal samples
+                }
                 else if (st == DEC_NEED_IMAGE_OUT_BUFFER)
                 {
-                    if (img == null) return null; nuint size; if (JxlDecoderImageOutBufferSize(dec, &pf, &size) != DEC_SUCCESS || (int)size != img.Rgb.Length) return null;
-                    hOut = GCHandle.Alloc(img.Rgb, GCHandleType.Pinned);
+                    if (img == null) return null; byte[] target = rgba ?? img.Rgb;
+                    nuint size; if (JxlDecoderImageOutBufferSize(dec, &pf, &size) != DEC_SUCCESS || (long)size != target.Length) return null;
+                    hOut = GCHandle.Alloc(target, GCHandleType.Pinned);
                     if (JxlDecoderSetImageOutBuffer(dec, &pf, (byte*)hOut.AddrOfPinnedObject(), size) != DEC_SUCCESS) return null;
                 }
-                else if (st == DEC_FULL_IMAGE || st == DEC_SUCCESS) break;
-                else if (st == DEC_ERROR) return null;
+                else if (st == DEC_FULL_IMAGE || st == DEC_SUCCESS) done = true;
+                else return null;   // an error, or a status that a complete, closed input should never produce
+            }
+            if (img != null && rgba != null)
+            {
+                img.Alpha = new byte[img.W * img.H];
+                for (int i = 0, s = 0, d = 0; i < img.Alpha.Length; i++, s += 4, d += 3) { img.Rgb[d] = rgba[s]; img.Rgb[d + 1] = rgba[s + 1]; img.Rgb[d + 2] = rgba[s + 2]; img.Alpha[i] = rgba[s + 3]; }
             }
             return img;
         }

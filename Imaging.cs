@@ -77,7 +77,7 @@ public sealed class RgbImage
         }
         return o;
     }
-    /// <summary>Undo a k x k nearest-neighbour enlargement whose cells start at (phaseX, phaseY): every cell becomes
+    /// <summary>Undo a k x k nearest-neighbor enlargement whose cells start at (phaseX, phaseY): every cell becomes
     /// its middle sample, partial cells at the edges included, so no interior row or column is dropped.</summary>
     public RgbImage UndoGrid(int k, int phaseX, int phaseY)
     {
@@ -184,7 +184,7 @@ public static class Filters
         return o;
     }
 
-    /// <summary>Median-cut colour quantization to at most k colours (no dither). Used for the opt-in /snap step.</summary>
+    /// <summary>Median-cut colour quantization to at most k colors (no dither). Used for the opt-in /snap step.</summary>
     public static RgbImage MedianCut(RgbImage img, int k)
     {
         var hist = new Dictionary<int, int>();
@@ -233,8 +233,9 @@ public sealed class ClassResult
     public int GridPhaseX, GridPhaseY;    // where the k x k cells start in the full image (a cropped sprite rarely starts at 0)
     public int Width, Height, Colors; public double Density = 1; public string Note = "";
     public double HardRatioNative = -1;   // same ratio measured on full-resolution crops (no point sampling)
-    public double Soft = -1, Multi = -1;  // texture: tiny-difference share among differing neighbours; share of hard 3x3 windows holding 7+ colours
+    public double Soft = -1, Multi = -1;  // texture: tiny-difference share among differing neighbours; share of hard 3x3 windows holding 7+ colors
     public bool Dithered;                 // palette image whose texture says "quantized soft picture": kept out of the pixel-art rules
+    public bool Borderline;               // called a photo, but with edges nearly as hard as a drawing's (paintings, cel art with gradients)
 }
 
 public static class Classifier
@@ -262,7 +263,7 @@ public static class Classifier
         // the same measurement on full-resolution crops: point sampling a large photo makes its soft edges
         // look hard (neighbouring proxy pixels are several source pixels apart), so this is the honest value
         res.HardRatioNative = Math.Round(HardRatioOnCrops(full), 3);
-        // nearest-neighbour grid test on a full-resolution centre crop: NN round trip must beat bilinear clearly
+        // nearest-neighbor grid test on a full-resolution centre crop: NN round trip must beat bilinear clearly
         var crop = full.CenterCrop(384);
         double bestGain = 0;
         foreach (int k in new[] { 2, 3, 4, 5, 6, 8 })
@@ -270,7 +271,7 @@ public static class Classifier
             int kw = crop.W / k * k, kh = crop.H / k * k;
             if (kw < 48 || kh < 48) continue;   // too few cells below this: the phase search would find grids in noise
             var c = CropTopLeft(crop, kw, kh);
-            // nearest-neighbour round trip (middle sample of each k x k cell) versus a smooth round trip
+            // nearest-neighbor round trip (middle sample of each k x k cell) versus a smooth round trip
             // (k x k box average, then bilinear). A real pixel grid reproduces exactly under the first and
             // blurs under the second; a photo or anti-aliased drawing does not prefer the first.
             var (pn, ox, oy) = BestPhaseNn(c, k);   // a cropped or padded sprite rarely starts on a cell boundary: try every grid phase
@@ -296,15 +297,15 @@ public static class Classifier
         }
         int lng = Math.Max(res.Width, res.Height);
         (res.Soft, res.Multi) = Texture(full);
-        // Palette formats make every small GIF look like a sprite (<= 256 colours, dithered hard edges). The texture of a
+        // Palette formats make every small GIF look like a sprite (<= 256 colors, dithered hard edges). The texture of a
         // quantized soft picture gives it away: many tiny neighbour differences (adjacent palette entries, >= 16%), or
-        // hard 3x3 windows holding 7+ colours (gradient edges, >= 45%), or hardly any hard edges at all (< 12%).
+        // hard 3x3 windows holding 7+ colors (gradient edges, >= 45%), or hardly any hard edges at all (< 12%).
         // The 47 xBRZ sample screens stay below 0.14 / 0.40 and above 0.16; dithered GIFs of photos and drawings land
         // at 0.16-0.85 / 0.45-0.83. JPEG noise would trigger this on genuine sprites, so lossy sources are exempt.
         bool paletteRule = lng <= 512 && res.Density <= 0.02 || lng <= 256 && hr >= 0.4;
         res.Dithered = !lossy && res.GridK < 2 && paletteRule && (res.Soft >= 0.16 || res.Multi >= 0.45 || res.HardRatioNative < 0.12);
-        if (res.GridK >= 2) { res.Class = "pixelart"; res.Confidence = res.GridDb >= 60 ? 0.95 : 0.8; res.Note = $"nearest-neighbour grid {res.GridK}x ({res.GridDb} dB)"; }
-        else if (!res.Dithered && lng <= 512 && res.Density <= 0.02) { res.Class = "pixelart"; res.Confidence = Math.Round(0.7 + 0.25 * Math.Min(1.0, (0.02 - res.Density) / 0.02), 2); res.Note = $"small palette image ({lng} px, {res.Colors} colours)"; }
+        if (res.GridK >= 2) { res.Class = "pixelart"; res.Confidence = res.GridDb >= 60 ? 0.95 : 0.8; res.Note = $"nearest-neighbor grid {res.GridK}x ({res.GridDb} dB)"; }
+        else if (!res.Dithered && lng <= 512 && res.Density <= 0.02) { res.Class = "pixelart"; res.Confidence = Math.Round(0.7 + 0.25 * Math.Min(1.0, (0.02 - res.Density) / 0.02), 2); res.Note = $"small palette image ({lng} px, {res.Colors} colors)"; }
         else if (!res.Dithered && lng <= 256 && hr >= 0.4) { res.Class = "pixelart"; res.Confidence = Math.Round(0.6 + 0.3 * Math.Min(1.0, (hr - 0.4) / 0.6), 2); res.Note = $"small image with hard edges ({lng} px)"; }
         else
         {
@@ -315,7 +316,7 @@ public static class Classifier
             double hn = res.HardRatioNative; double soft = Math.Min(hr, hn);
             if (hr >= 0.4 && hn >= 0.3) { res.Class = "art"; res.Confidence = Math.Round(0.6 + 0.4 * Math.Min(1.0, (soft - 0.3) / 0.4), 2); res.Note = $"hard-edge ratio {res.HardRatio} (native {hn})"; }
             else if (hr < 0.3 || hn < 0.2) { res.Class = "photo"; res.Confidence = Math.Round(0.6 + 0.4 * Math.Min(1.0, (0.3 - Math.Min(hr, 0.3)) / 0.3 + (0.2 - Math.Min(hn, 0.2)) / 0.2) / 1.0, 2); res.Note = $"hard-edge ratio {res.HardRatio} (native {hn})"; }
-            else { res.Class = "photo"; res.Confidence = 0.5; res.Note = $"borderline, painting-like (ratio {res.HardRatio}, native {hn})"; }
+            else { res.Class = "photo"; res.Confidence = 0.5; res.Borderline = true; res.Note = $"borderline, painting-like (ratio {res.HardRatio}, native {hn})"; }
             if (res.Confidence > 1) res.Confidence = 1;
             if (res.Dithered) res.Note += "; palette image with gradients, not pixel art";
         }
@@ -324,7 +325,7 @@ public static class Classifier
     /// <summary>Texture of a native-resolution centre crop (up to 512x512). soft: among neighbouring pixel pairs that
     /// differ at all, the share that differs by at most 6 levels (adjacent entries of a palette fitted to a soft picture;
     /// pixel-art palettes have coarser steps). multi: among 3x3 windows with a hard edge (gray range > 64), the share
-    /// holding 7 or more distinct colours (a gradient crossing the edge; a pixel-art edge is a two- or three-colour step).</summary>
+    /// holding 7 or more distinct colors (a gradient crossing the edge; a pixel-art edge is a two- or three-colour step).</summary>
     static (double soft, double multi) Texture(RgbImage img)
     {
         var c = img.CenterCrop(512); int w = c.W, h = c.H; if (w < 3 || h < 3) return (0, 0);
@@ -338,8 +339,8 @@ public static class Classifier
                 int dr = D(a, p, p + 3), dd = D(a, p, p + w * 3);
                 if (dr > 0) { diff++; if (dr <= 6) tiny++; }
                 if (dd > 0) { diff++; if (dd <= 6) tiny++; }
-                // colours inside a hard 3x3 window: a pixel-art edge is a two- or three-colour step, a downscaled soft
-                // drawing or photo crosses an edge through a gradient of five or more distinct colours
+                // colors inside a hard 3x3 window: a pixel-art edge is a two- or three-colour step, a downscaled soft
+                // drawing or photo crosses an edge through a gradient of five or more distinct colors
                 int gmn = 255, gmx = 0, k = 0;
                 for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) { int i = (y + dy) * w + x + dx; int v = g[i]; if (v < gmn) gmn = v; if (v > gmx) gmx = v; win[k++] = a[i * 3] << 16 | a[i * 3 + 1] << 8 | a[i * 3 + 2]; }
                 if (gmx - gmn > 64)
@@ -376,7 +377,7 @@ public static class Classifier
         }
         return any > 0 ? (double)hard / any : 0;
     }
-    /// <summary>PSNR of the nearest-neighbour round trip (every pixel replaced by the middle sample of its k x k cell)
+    /// <summary>PSNR of the nearest-neighbor round trip (every pixel replaced by the middle sample of its k x k cell)
     /// at the best of the k*k possible grid phases.</summary>
     static (double psnr, int ox, int oy) BestPhaseNn(RgbImage c, int k)
     {
@@ -427,14 +428,14 @@ public static class Png
     static uint[] BuildCrc() { var t = new uint[256]; for (uint n = 0; n < 256; n++) { uint c = n; for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1; t[n] = c; } return t; }
     static uint Crc(byte[] data, int off, int len) { uint c = 0xFFFFFFFFu; for (int i = off; i < off + len; i++) c = CrcTable[(c ^ data[i]) & 255] ^ (c >> 8); return c ^ 0xFFFFFFFFu; }
 
-    public static void Write(string path, RgbImage img, byte[]? icc = null, byte[]? exif = null)
+    public static void Write(string path, RgbImage img, byte[]? icc = null, byte[]? exif = null, bool gray = false)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
         fs.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 });
-        bool alpha = img.Alpha != null; int bpp = alpha ? 4 : 3;
+        bool alpha = img.Alpha != null; int colour = gray ? 1 : 3, bpp = colour + (alpha ? 1 : 0);
         var ihdr = new byte[13];
         BinaryPrimitives.WriteInt32BigEndian(ihdr.AsSpan(0), img.W); BinaryPrimitives.WriteInt32BigEndian(ihdr.AsSpan(4), img.H);
-        ihdr[8] = 8; ihdr[9] = (byte)(alpha ? 6 : 2); ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+        ihdr[8] = 8; ihdr[9] = (byte)(gray ? (alpha ? 4 : 0) : (alpha ? 6 : 2)); ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
         Chunk(fs, "IHDR", ihdr);
         if (icc != null && icc.Length > 0)
         {
@@ -450,8 +451,14 @@ public static class Png
         for (int y = 0; y < img.H; y++)
         {
             int ro = y * (stride + 1); raw[ro] = 1;
-            if (alpha) { for (int x = 0; x < img.W; x++) { int sp = (y * img.W + x) * 3; row[x * 4] = img.Rgb[sp]; row[x * 4 + 1] = img.Rgb[sp + 1]; row[x * 4 + 2] = img.Rgb[sp + 2]; row[x * 4 + 3] = img.Alpha![y * img.W + x]; } }
-            else Buffer.BlockCopy(img.Rgb, y * stride, row, 0, stride);
+            if (!alpha && !gray) Buffer.BlockCopy(img.Rgb, y * stride, row, 0, stride);
+            else
+                for (int x = 0, d = 0; x < img.W; x++)
+                {
+                    int sp = (y * img.W + x) * 3; row[d++] = img.Rgb[sp];
+                    if (!gray) { row[d++] = img.Rgb[sp + 1]; row[d++] = img.Rgb[sp + 2]; }
+                    if (alpha) row[d++] = img.Alpha![y * img.W + x];
+                }
             for (int i = 0; i < stride; i++) { int left = i >= bpp ? row[i - bpp] : 0; raw[ro + 1 + i] = (byte)(row[i] - left); }
         }
         using var ms = new MemoryStream();
@@ -473,13 +480,35 @@ public static class Png
 /// <summary>Loads PNG/GIF/BMP/WebP (first frame) through ImageSharp for the classifier and the pixel-art route.</summary>
 public static class Loader
 {
-    public static RgbImage? LoadNonJpeg(string path, out int frames)
+    /// <summary>ImageSharp limited to the decoders this program hands files to. Its TIFF, TGA, PBM and QOI decoders
+    /// (where the advisories against 3.1.12 sit) cannot be reached, whatever a file claims to be.</summary>
+    public static readonly SixLabors.ImageSharp.Formats.DecoderOptions Formats = new()
     {
-        frames = 1;
+        Configuration = new SixLabors.ImageSharp.Configuration(
+            new SixLabors.ImageSharp.Formats.Png.PngConfigurationModule(), new SixLabors.ImageSharp.Formats.Gif.GifConfigurationModule(),
+            new SixLabors.ImageSharp.Formats.Bmp.BmpConfigurationModule(), new SixLabors.ImageSharp.Formats.Webp.WebpConfigurationModule()),
+    };
+
+    public static RgbImage? LoadNonJpeg(string path, out int frames) => LoadNonJpeg(path, out frames, out _);
+
+    public static RgbImage? LoadNonJpeg(string path, out int frames, out byte[]? icc) => LoadNonJpeg(path, out frames, out icc, out _);
+
+    /// <param name="exif">the TIFF structure of the Exif data the file carries (PNG eXIf, WebP EXIF), or null</param>
+    public static RgbImage? LoadNonJpeg(string path, out int frames, out byte[]? icc, out byte[]? exif)
+    {
+        frames = 1; icc = null; exif = null;
         try
         {
-            using var im = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgba32>(path);
+            using var im = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgba32>(Formats, path);
             frames = im.Frames.Count;
+            try { icc = im.Metadata.IccProfile?.ToByteArray(); } catch { icc = null; }   // raw bytes; the profile is never parsed
+            try
+            {
+                var e = im.Metadata.ExifProfile?.ToByteArray();
+                if (e != null && e.Length > 14 && e[0] == (byte)'E' && e[1] == (byte)'x' && e[2] == (byte)'i' && e[3] == (byte)'f') e = e[6..];   // some writers keep the "Exif\0\0" prefix
+                if (e != null && e.Length >= 14 && (e[0] == (byte)'I' && e[1] == (byte)'I' || e[0] == (byte)'M' && e[1] == (byte)'M')) exif = e;
+            }
+            catch { exif = null; }
             int w = im.Width, h = im.Height; var img = new RgbImage(w, h); var alpha = new byte[w * h]; bool anyAlpha = false;
             im.ProcessPixelRows(acc =>
             {
