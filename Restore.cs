@@ -26,6 +26,8 @@ public sealed class RestoreParams
     // shift stage
     public int Shifts;                  // 0 = off, 64 = every block shift, 16 = every second one in each direction, 4 = every fourth
     public float ShiftStrength = 1f;    // noise level of the Wiener rule relative to the uniform-bin variance q^2 / 12
+    public bool TextureAdapt;           // photo method: below quality 70, weaken the Wiener rule and the pocs pass in regions
+                                        // of isotropic texture (Restorer.TextureMap)
     // pocs stage
     public int PocsIterations;          // 0 = off
     public bool Diagonals = true;
@@ -73,6 +75,9 @@ public sealed class RestoreStats
     public int Planes;
     public double NoiseY;       // noise scale of the luma plane in grey levels
     public int Iterations;      // iterations the smoothing stage ran
+    public double Isotropy = -1;    // luma isotropy of the plain decode (TextureAdapt only; -1 = not measured)
+    public float Texture = 1f;      // mean share of the denoising TextureAdapt kept over the picture (1 = all of it)
+    public float Eased;             // share of the picture where TextureAdapt eased the denoising
     public string Note = "";    // anything the caller should tell the user (a stage that was skipped)
 }
 
@@ -99,15 +104,17 @@ public static class Restorer
         var planes = new float[n][];
         for (int c = 0; c < n; c++) planes[c] = Decode(ci.Planes[c], p.Shrink);
         stats.NoiseY = Math.Round(NoiseScale(ci.Planes[0]) * p.SigmaScale, 2);
+        // photo method: how much of the denoising each region keeps (null = all of it)
+        float[]? texture = p.TextureAdapt && !ci.Planes[0].Frozen && (p.Shifts > 0 || p.PocsIterations > 0) ? TextureMap(ci.Planes[0], planes[0], stats) : null;
 
         if (p.Shifts > 0)
             for (int c = 0; c < n; c++)
             {
                 var pl = ci.Planes[c]; if (pl.Frozen) continue;
-                ShiftAverage(pl, planes[c], p); Project(pl, planes[c], planes[c], p.Shrink);
+                ShiftAverage(pl, planes[c], p, texture != null ? PlaneMap(pl, ci.Planes[0], texture) : null); Project(pl, planes[c], planes[c], p.Shrink);
             }
         if (p.PocsIterations > 0)
-            for (int c = 0; c < n; c++) if (!ci.Planes[c].Frozen) Pocs(ci.Planes[c], planes[c], p.PocsIterations, p);
+            for (int c = 0; c < n; c++) if (!ci.Planes[c].Frozen) Pocs(ci.Planes[c], planes[c], p.PocsIterations, p, texture != null ? PlaneMap(ci.Planes[c], ci.Planes[0], texture) : null);
 
         bool tv = p.Iterations > 0 && ci.IntegerSubsampling && (!p.ChromaOnly || n >= 3);
         int wf = 0, hf = 0;
@@ -136,6 +143,84 @@ public static class Restorer
     }
 
     // ---------------------------------------------------------------- shared pieces
+
+    /// <summary>How much of the Wiener rule (and of the pocs pass) the photo method keeps in a region with texture.
+    /// The rule treats every coefficient near the quantization noise as noise; in isotropic texture (foliage, water,
+    /// fabric, grain) many of those are texture, and below quality 70 shrinking them costs SSIM and, beyond isotropy
+    /// 0.2, PSNR as well. Measured on the Kodak and texture sets: half strength from isotropy 0.25 up gains both
+    /// measures at quality 10 to 50; grain-like texture (0.45 and up), which a low quality cannot keep anyway, keeps
+    /// the SSIM of a plain decode only when its luma is left as decoded. At quality 70 and up the full rule is best.</summary>
+    internal static double TextureKeep(double iso) =>
+        iso <= 0.18 ? 1 : iso <= 0.25 ? 1 - 0.5 * (iso - 0.18) / 0.07 : iso <= 0.40 ? 0.5 : iso <= 0.45 ? 0.5 * (0.45 - iso) / 0.05 : 0;
+
+    /// <summary>The share of the denoising kept in every 8x8 block of the luma plane (1 = all of it), or null when the
+    /// quality is 70 or higher. The isotropy is read in windows of 3x3 tiles of 32 pixels (96 pixels), so a sky above
+    /// a field of grain keeps its full denoising. A window with little structure above the noise (under 5 percent of
+    /// its pixels, fading in up to 15) counts as smooth when it has little above a third of the noise as well (a sky's
+    /// block steps stay below that at every quality), and otherwise follows the isotropy of the whole picture; in a
+    /// picture that is grain as a whole, texture windows below half strength follow it as well, since their own
+    /// isotropy scatters around the grain line. The effect fades in between noise scale 2.75 (quality 70) and 3.9
+    /// (quality 50). Fills the isotropy of the whole picture and the shares of eased blocks into stats.</summary>
+    static float[]? TextureMap(CoefPlane y, float[] py, RestoreStats stats)
+    {
+        double ns = NoiseScale(y), low = Math.Clamp((ns - 2.75) / (3.9 - 2.75), 0, 1);
+        if (low <= 0) return null;
+        const int Tile = 32;
+        Action<int, float[]> rows = (r, row) => Array.Copy(py, r * y.W, row, 0, y.CompW);
+        var t = Classifier.StructureTiles(y.CompW, y.CompH, rows, ns, Tile);
+        // the weaker structure, above a third of the noise scale: where nothing stands above the noise, it tells a smooth
+        // area (a sky's block steps stay below it) from texture that the compression all but wiped out
+        var u = Classifier.StructureTiles(y.CompW, y.CompH, rows, ns / 3, Tile);
+        double l1All = 0, l2All = 0; long actAll = 0; for (int i = 0; i < t.L1.Length; i++) { l1All += t.L1[i]; l2All += t.L2[i]; actAll += t.Active[i]; }
+        stats.Isotropy = l1All > 0 ? Math.Round(l2All / l1All, 3) : -1;
+        // the picture's own verdict (needs structure on 0.5 percent of the picture)
+        double keepPicture = l1All > 0 && actAll >= Math.Max(500, (long)y.CompW * y.CompH / 200) ? TextureKeep(l2All / l1All) : 1;
+        static double Fade(double share) { double s = Math.Clamp((share - 0.05) / 0.10, 0, 1); return s * s * (3 - 2 * s); }
+        var tf = new float[t.Tw * t.Th];
+        for (int j = 0; j < t.Th; j++)
+            for (int i = 0; i < t.Tw; i++)
+            {
+                double l1 = 0, l2 = 0; long act = 0, weak = 0, pix = 0;
+                for (int b = Math.Max(0, j - 1); b <= Math.Min(t.Th - 1, j + 1); b++)
+                    for (int a = Math.Max(0, i - 1); a <= Math.Min(t.Tw - 1, i + 1); a++)
+                    { int k = b * t.Tw + a; l1 += t.L1[k]; l2 += t.L2[k]; act += t.Active[k]; weak += u.Active[k]; pix += t.Pixels[k]; }
+                double ws = pix > 0 ? Fade((double)act / pix) : 0, wu = pix > 0 ? Fade((double)weak / pix) : 0;
+                double keepRegion = l1 > 0 ? TextureKeep(l2 / l1) : 1;
+                // in a picture that is grain as a whole, texture regions scattering around the grain line follow it
+                if (keepRegion < 0.5 && keepPicture < keepRegion) keepRegion = keepPicture;
+                // structure above the noise: the region's own isotropy; only weaker structure (texture the compression all
+                // but wiped out; the block grid makes its own isotropy unreliable): the picture's verdict; none: smooth
+                double keep = ws * keepRegion + (1 - ws) * (wu * keepPicture + (1 - wu));
+                tf[j * t.Tw + i] = (float)(1 - (1 - keep) * low);
+            }
+        // per block, bilinear between tile centres
+        var map = new float[y.Bw * y.Bh]; double sum = 0; int eased = 0, blocks = 0;
+        for (int by = 0; by < y.Bh; by++)
+            for (int bx = 0; bx < y.Bw; bx++)
+            {
+                double fx = Math.Clamp((bx * 8 + 4 - Tile / 2) / (double)Tile, 0, t.Tw - 1), fy = Math.Clamp((by * 8 + 4 - Tile / 2) / (double)Tile, 0, t.Th - 1);
+                int x0 = (int)fx, y0 = (int)fy, x1 = Math.Min(t.Tw - 1, x0 + 1), y1 = Math.Min(t.Th - 1, y0 + 1); double ax = fx - x0, ay = fy - y0;
+                double v = (1 - ay) * ((1 - ax) * tf[y0 * t.Tw + x0] + ax * tf[y0 * t.Tw + x1]) + ay * ((1 - ax) * tf[y1 * t.Tw + x0] + ax * tf[y1 * t.Tw + x1]);
+                float f = v >= 0.999 ? 1f : (float)v; map[by * y.Bw + bx] = f;
+                if (bx * 8 < y.CompW && by * 8 < y.CompH) { sum += f; blocks++; if (f < 0.95f) eased++; }
+            }
+        stats.Texture = blocks > 0 ? (float)(sum / blocks) : 1f; stats.Eased = blocks > 0 ? (float)eased / blocks : 0f;
+        return map;
+    }
+
+    /// <summary>The texture map of the luma blocks, read at the centre of every block of another plane.</summary>
+    static float[] PlaneMap(CoefPlane pl, CoefPlane y, float[] lumaMap)
+    {
+        if (pl == y) return lumaMap;
+        var m = new float[pl.Bw * pl.Bh];
+        for (int by = 0; by < pl.Bh; by++)
+            for (int bx = 0; bx < pl.Bw; bx++)
+            {
+                int sx = Math.Min(pl.CompW - 1, bx * 8 + 4) * pl.Fx / y.Fx, sy = Math.Min(pl.CompH - 1, by * 8 + 4) * pl.Fy / y.Fy;
+                m[by * pl.Bw + bx] = lumaMap[Math.Min(y.Bh - 1, sy / 8) * y.Bw + Math.Min(y.Bw - 1, sx / 8)];
+            }
+        return m;
+    }
 
     /// <summary>Pixel-domain noise scale from the low-frequency AC steps. Most high-frequency coefficients quantize
     /// to zero with little real error, so the full-table RMS would overstate the noise several-fold; the first AC
@@ -217,7 +302,8 @@ public static class Restorer
     /// variance of the file's own quantization as the noise level, and the results are averaged. Block edges of the
     /// original grid fall inside the shifted blocks and average away; real structure, which is far above the noise
     /// level in the coefficients that carry it, passes nearly unchanged.</summary>
-    static void ShiftAverage(CoefPlane pl, float[] px, RestoreParams p)
+    /// <param name="map">share of the rule kept per block of this plane (TextureMap), or null for all of it</param>
+    static void ShiftAverage(CoefPlane pl, float[] px, RestoreParams p, float[]? map = null)
     {
         int w = pl.W, pw = w + 16, ph = pl.H + 16;
         var pad = new float[pw * ph]; var acc = new float[pw * ph];
@@ -240,6 +326,9 @@ public static class Restorer
                     for (int bx = 0; bx < nbx; bx++)
                     {
                         int i0 = (oy + by * 8) * pw + ox + bx * 8;
+                        // the share of the rule this block keeps, read at its centre (the padding is 8 samples wide)
+                        float tb = 1f;
+                        if (map != null) { int cx = Math.Clamp(ox + bx * 8 - 4, 0, pl.CompW - 1), cy = Math.Clamp(oy + by * 8 - 4, 0, pl.CompH - 1); tb = map[(cy >> 3) * pl.Bw + (cx >> 3)]; }
                         if (Vec)
                         {
                             for (int j = 0; j < 8; j++) for (int i = 0; i < 8; i += vs) (new Vector<float>(pad, i0 + j * pw + i) - v128).CopyTo(s.Slice(j * 8 + i));
@@ -247,7 +336,7 @@ public static class Restorer
                             for (int k = 0; k < 64; k += vs)
                             {
                                 // c (c^2 - n) / c^2 where the coefficient stands above the noise, nothing where it does not
-                                var c = new Vector<float>(f.Slice(k)); var nn = new Vector<float>(noise, k);
+                                var c = new Vector<float>(f.Slice(k)); var nn = new Vector<float>(noise, k); if (tb != 1f) nn *= tb;
                                 Vector.ConditionalSelect(Vector.GreaterThan(c * c, nn), c - nn / c, Vector<float>.Zero).CopyTo(f.Slice(k));
                             }
                             Dct8.Inverse(f, s);
@@ -258,7 +347,7 @@ public static class Restorer
                         {
                             for (int j = 0; j < 8; j++) for (int i = 0; i < 8; i++) s[j * 8 + i] = pad[i0 + j * pw + i] - 128f;
                             Dct8.Forward(s, f);
-                            for (int k = 1; k < 64; k++) { float c = f[k], c2 = c * c; f[k] = c2 > noise[k] ? c - noise[k] / c : 0f; }
+                            for (int k = 1; k < 64; k++) { float c = f[k], c2 = c * c, nk = noise[k] * tb; f[k] = c2 > nk ? c - nk / c : 0f; }
                             Dct8.Inverse(f, s);
                             for (int j = 0; j < 8; j++) for (int i = 0; i < 8; i++) acc[i0 + j * pw + i] += s[j * 8 + i] + 128f;
                         }
@@ -280,13 +369,16 @@ public static class Restorer
 
     // ---------------------------------------------------------------- pocs
 
-    static void Pocs(CoefPlane pl, float[] px, int iterations, RestoreParams p)
+    /// <param name="map">share of the denoising kept per block (TextureMap): the edge-aware pass keeps its full width
+    /// down to 0.5, narrows below, and leaves blocks under 0.025 alone</param>
+    static void Pocs(CoefPlane pl, float[] px, int iterations, RestoreParams p, float[]? map = null)
     {
         float noise = (float)(NoiseScale(pl) * p.SigmaScale);
         var smoothed = new float[px.Length];
+        float[]? scale = map == null ? null : Array.ConvertAll(map, v => Math.Min(1f, 2f * v));
         for (int it = 0; it < iterations; it++)
         {
-            Bilateral(px, smoothed, pl.W, pl.H, pl.CompW, pl.CompH, noise, p.Diagonals);
+            Bilateral(px, smoothed, pl.W, pl.H, pl.CompW, pl.CompH, noise, p.Diagonals, scale, pl.Bw);
             Project(pl, smoothed, px, p.Shrink);
         }
     }
@@ -294,14 +386,17 @@ public static class Restorer
     /// <summary>Edge-aware 3x3 smoothing: neighbours are weighted by exp(-d^2 / 2 sigma^2) so real edges (d >> sigma)
     /// are kept while quantization noise and block seams (d ~ sigma) are averaged away. Only the real component
     /// area is filtered; padding keeps its values.</summary>
-    static void Bilateral(float[] src, float[] dst, int w, int h, int cw, int ch, float sigma, bool diagonals)
+    /// <param name="scale">sigma factor per 8x8 block (bw blocks per row), or null; under 0.05 the pixel is kept</param>
+    static void Bilateral(float[] src, float[] dst, int w, int h, int cw, int ch, float sigma, bool diagonals, float[]? scale = null, int bw = 0)
     {
-        float inv = -1f / (2f * sigma * sigma); float diagW = diagonals ? 0.5f : 0f;
+        float inv0 = -1f / (2f * sigma * sigma); float diagW = diagonals ? 0.5f : 0f;
         Array.Copy(src, dst, src.Length);
         Parallel.For(0, ch, Par, y =>
         {
             for (int x = 0; x < cw; x++)
             {
+                float inv = inv0;
+                if (scale != null) { float sc = scale[(y >> 3) * bw + (x >> 3)]; if (sc < 0.05f) continue; if (sc < 1f) inv = inv0 / (sc * sc); }
                 int i = y * w + x; float c = src[i]; float sum = c, wsum = 1f;
                 for (int dy = -1; dy <= 1; dy++)
                 {

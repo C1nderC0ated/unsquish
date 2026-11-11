@@ -1,13 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <TargetFramework>net11.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>unsquish</AssemblyName>
     <RootNamespace>Unsquish</RootNamespace>
-    <Version>0.8.0</Version>
+    <Version>0.8.1</Version>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
@@ -18,7 +18,8 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <NoWarn>IL2026;IL2104;IL3000;IL3002;CA1416;WFO5001</NoWarn>
+    <!-- WFO2000 (new in the .NET 11 Windows Forms analyzers): Restorer.Par and Presets.Plain hand out a fresh object on purpose -->
+    <NoWarn>IL2026;IL2104;IL3000;IL3002;CA1416;WFO5001;WFO2000</NoWarn>
     <_SuppressWinFormsTrimError>true</_SuppressWinFormsTrimError>
   </PropertyGroup>
   <ItemGroup>

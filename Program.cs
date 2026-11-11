@@ -27,7 +27,7 @@ public sealed class RunResult { public Dictionary<string, int> Counts = new(); p
 /// <summary>Everything the tool does, driven by Options; reports through callbacks so the CLI and the window share it.</summary>
 public static class Engine
 {
-    public const string Version = "0.8.0";
+    public const string Version = "0.8.1";
 
     public static RunResult Run(Options o, Action<string, ConsoleColor?> log, Action<int, int>? progress = null, CancellationToken ct = default)
     {
@@ -73,7 +73,7 @@ public static class Engine
         if (dropped > 0) log($"  note: {dropped} input file(s) lie inside the output folder and are skipped; an output folder cannot also be an input", ConsoleColor.Yellow);
         var forced = new List<string>();
         if (o.ExplicitQs) forced.Add("level " + o.Qs); if (o.ExplicitBlur) forced.Add("blur " + (o.Blur ? "on" : "off")); if (o.Xbrz > 0) forced.Add("scale " + o.Xbrz + "x"); if (o.Smooth) forced.Add("smooth xBRZ"); if (o.Snap > 0) forced.Add("snap " + o.Snap + " colors"); if (o.ForceClass != null) forced.Add("class " + o.ForceClass);
-        log(o.Auto ? "  auto:   photo -> level 4; art -> level 6; in between -> level 4 with smoothing; pixel art -> crisp upscale" + (forced.Count > 0 ? "  (forced: " + string.Join(", ", forced) + ")" : "")
+        log(o.Auto ? "  auto:   photo -> level 4; art, or a photo that is flat or free of texture -> art method, level 6; in between -> art method, level 4; pixel art -> crisp upscale" + (forced.Count > 0 ? "  (forced: " + string.Join(", ", forced) + ")" : "")
                    : $"  auto:   off (every JPEG below qf {o.Qf} is treated as a photo)", null);
         log($"  jxl:    {(Jxl.Available ? "libjxl " + Jxl.VersionString + " (bundled)" : "not available")}", null);
         log($"  mode:   {o.Mode}{(o.Mode == "jpg" ? " quality " + o.JpegQuality : "")}, threshold qf {o.Qf}, earlier-compression search {(o.History ? "on" : "off")}, threads {o.Threads}{(o.Dry ? ", DRY RUN" : "")}", null);
@@ -115,7 +115,7 @@ public static class Engine
                     if (decoded != null) cls = Classifier.Classify(decoded, info.IsJpeg); else cls.Note = "decode failed";   // animations: first frame
                 }
                 catch (Exception ex) { cls.Note = "classify failed: " + ex.Message; }
-                if (o.ForceClass != null && decoded != null) { cls.Class = o.ForceClass; cls.Confidence = 1; cls.Borderline = false; cls.Note = "forced"; }
+                if (o.ForceClass != null && decoded != null) { cls.Class = o.ForceClass; cls.Confidence = 1; cls.Borderline = false; cls.Note = "forced"; cls.MethodFromClass(); }
             }
             // an earlier, harsher compression that the file no longer declares (never looked for in pixel art)
             if (o.History && cls.Class != "pixelart")
@@ -128,18 +128,26 @@ public static class Engine
                 catch (Exception ex) { hist = new HistoryResult { Note = "history check failed: " + ex.Message }; }
             }
             var (route, reason) = Route(info, o, cls, fmt, frames, hist, coefs != null);
+            // photo or drawing: the restoration method is measured on the plain decode at the noise level of the compression
+            // that is undone (measured only for files that are restored, and for /features)
+            if (o.Auto && o.ForceClass == null && decoded != null && (route == "restore" || o.Features))
+            {
+                try { Classifier.ChooseMethod(cls, decoded, coefs != null ? Restorer.NoiseScale(coefs.Planes[0]) : 0); }
+                catch (Exception ex) { cls.MethodFromClass(); cls.MethodNote = "method check failed: " + ex.Message; }
+                if (route == "restore" && cls.MethodNote.Length > 0) reason += $" ({cls.MethodNote}: {cls.Method} method)";
+            }
             // two inputs with the same relative name (D:\2019\IMG_0001.jpg and D:\2020\IMG_0001.jpg) must not share an output;
             // a skipped file writes nothing and claims nothing
             string wanted = outBase; int dup = 1;
             if (route != "skip") while (!claimed.Add(outBase)) outBase = $"{wanted} ({++dup})";
-            int effQs = o.ExplicitQs ? o.Qs : (cls.Class == "art" ? 6 : 4); bool effBlur = o.ExplicitBlur && o.Blur;
+            int effQs = o.ExplicitQs ? o.Qs : cls.Level; bool effBlur = o.ExplicitBlur && o.Blur;
             string tag = $"[{n}/{files.Count}] {rel}" + (o.Auto && cls.Class != "-" ? $"  [{cls.Class} {cls.Confidence.ToString("0.00", CultureInfo.InvariantCulture)}]" : "");
             if (dup > 1) log($"{tag}  note: same name as an earlier input, written as {Path.GetFileName(outBase)}.*", ConsoleColor.Yellow);
             if (route == "skip") { status = "skip"; msg = reason; counts["skip"]++; log($"{tag}  SKIP  {msg}", ConsoleColor.Yellow); }
             else if (o.Dry)
             {
                 status = "dry"; msg = reason; counts[route]++;
-                if (o.Features) log($"{rel}\t{cls.Class}\thr_proxy={cls.HardRatio.ToString(CultureInfo.InvariantCulture)}\thr_native={cls.HardRatioNative.ToString(CultureInfo.InvariantCulture)}\tdensity={cls.Density.ToString(CultureInfo.InvariantCulture)}\tsoft={cls.Soft.ToString(CultureInfo.InvariantCulture)}\tmulti={cls.Multi.ToString(CultureInfo.InvariantCulture)}\tdithered={(cls.Dithered ? 1 : 0)}\tgrid={cls.GridK}\t{cls.Width}x{cls.Height}\tqf={info.Qf}\t{route}", ConsoleColor.Cyan);
+                if (o.Features) log($"{rel}\t{cls.Class}\thr_proxy={cls.HardRatio.ToString(CultureInfo.InvariantCulture)}\thr_native={cls.HardRatioNative.ToString(CultureInfo.InvariantCulture)}\tdensity={cls.Density.ToString(CultureInfo.InvariantCulture)}\tsoft={cls.Soft.ToString(CultureInfo.InvariantCulture)}\tmulti={cls.Multi.ToString(CultureInfo.InvariantCulture)}\tdithered={(cls.Dithered ? 1 : 0)}\tgrid={cls.GridK}\tflat={cls.Flat.ToString(CultureInfo.InvariantCulture)}\tiso={cls.Iso.ToString(CultureInfo.InvariantCulture)}\tmethod={cls.Method}{cls.Level}\t{cls.Width}x{cls.Height}\tqf={info.Qf}\t{route}", ConsoleColor.Cyan);
                 else log($"{tag}  would {route.ToUpperInvariant()}  ({reason})", ConsoleColor.Cyan);
             }
             else
@@ -286,13 +294,15 @@ public static class Engine
         RgbImage? img; string what; bool gray = false;
         if (coefs != null)
         {
-            // A picture between photograph and drawing gets the drawing method at the photo level: measured, drawings
-            // the classifier takes for photographs gain 1 to 3 dB from it, and a real photograph in that band loses
-            // about 0.1 dB against the photo method while staying well above a plain decode.
-            var (rp, label) = Presets.For(cls.Class == "photo" && cls.Borderline ? "art" : cls.Class, level);
+            // the method comes from the classifier (Classifier.ChooseMethod): drawings and texture-free pictures that the
+            // edge test calls photographs get the art method, a borderline picture the art method at the photo level
+            var (rp, label) = Presets.For(cls.Method, level);
             if (rp.ChromaOnly && coefs.Planes.Length < 3) { rp.Iterations = 0; label = label.Replace(" + luma-guided chroma", "").Split(" (")[0] + " (gray: no chroma stage)"; }
             img = Restorer.Run(coefs, rp, out var st);
             what = $"level {level}: {label}" + (st.Note.Length > 0 ? " (" + st.Note + ")" : "");
+            if (st.Eased >= 0.01f)
+                what += st.Texture < 0.025f ? $" (grain-like texture, isotropy {st.Isotropy.ToString(CultureInfo.InvariantCulture)}: luma left as decoded)"
+                                            : $" (texture: denoising eased on {Math.Round(100 * st.Eased)}% of the picture, isotropy {st.Isotropy.ToString(CultureInfo.InvariantCulture)})";
             gray = coefs.Planes.Length == 1;
         }
         else

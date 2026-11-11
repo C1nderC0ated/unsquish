@@ -236,6 +236,20 @@ public sealed class ClassResult
     public double Soft = -1, Multi = -1;  // texture: tiny-difference share among differing neighbours; share of hard 3x3 windows holding 7+ colors
     public bool Dithered;                 // palette image whose texture says "quantized soft picture": kept out of the pixel-art rules
     public bool Borderline;               // called a photo, but with edges nearly as hard as a drawing's (paintings, cel art with gradients)
+    // How a JPEG of the picture is restored. The class follows from the edge test alone; the method also looks at flat
+    // areas and at the texture (Classifier.ChooseMethod), so a drawing called a photo can still get the art method.
+    public string Method = "photo";       // "photo" or "art"
+    public int Level = 4;                 // default restoration level for that method
+    public string MethodNote = "";        // why the method differs from what the class alone would give
+    public double Flat = -1, Iso = -1;    // share of exactly flat 16x16 tiles; isotropy of the luma structure (-1: not measured)
+
+    /// <summary>The method that the class alone gives: art at level 6, a borderline photo the art method at level 4,
+    /// anything else the photo method at level 4.</summary>
+    public void MethodFromClass()
+    {
+        (Method, Level) = Class == "art" || Class == "pixelart" ? ("art", 6) : (Class == "photo" && Borderline ? ("art", 4) : ("photo", 4));
+        MethodNote = "";
+    }
 }
 
 public static class Classifier
@@ -320,6 +334,120 @@ public static class Classifier
             if (res.Confidence > 1) res.Confidence = 1;
             if (res.Dithered) res.Note += "; palette image with gradients, not pixel art";
         }
+        res.MethodFromClass();
+        return res;
+    }
+
+    /// <summary>Which restoration method a picture the edge test called a photo gets, judged by what the methods do to
+    /// it rather than by its label. The art method (smoothing what is flat) gains drawings about twice what the photo
+    /// method does and clean digital photographs about 0.5 dB more, and costs SSIM where real texture is left in the
+    /// file; the photo method keeps texture. So a photo gets the art method when at least 40 percent of it is exactly
+    /// flat (drawings and screenshots on plain backgrounds, rendered pictures; of the 24 Kodak photographs only one with
+    /// a large sky comes near, 45 percent at quality 10), or when its structure is oriented: edges and smooth
+    /// gradients, hardly any isotropic texture (isotropy at most 0.08; photographs 0.09 and up). A borderline picture keeps
+    /// the art method at the photo level unless its texture is isotropic (above 0.10, photograph detail). Both measures
+    /// stay put from quality 10 to 85 on drawings: flat areas decode exactly flat at any quality, and the isotropy
+    /// only counts structure above the noise scale of the compression. Art keeps the art method, pixel art its route.</summary>
+    /// <param name="plain">the plain decode</param>
+    /// <param name="noise">noise scale of the compression the restorer will undo (Restorer.NoiseScale); 0 when unknown</param>
+    public static void ChooseMethod(ClassResult res, RgbImage plain, double noise)
+    {
+        if (res.Class != "photo" && res.Class != "art") return;
+        double flat = FlatShare(plain);
+        var (iso, active) = Isotropy(plain, Math.Max(noise, 1.25));
+        res.Flat = Math.Round(flat, 3);
+        // too little structure above the noise to tell texture from edges (a picture of soft clouds at quality 10)
+        bool known = active >= Math.Max(500, (long)plain.W * plain.H / 200);
+        res.Iso = known ? Math.Round(iso, 3) : -1;
+        if (res.Class != "photo") return;
+        res.MethodFromClass();
+        if (flat >= 0.4) { res.Method = "art"; res.Level = 6; res.MethodNote = $"{Math.Round(100 * flat)}% flat"; }
+        else if (known && iso <= 0.08) { res.Method = "art"; res.Level = 6; res.MethodNote = $"edges without texture, isotropy {res.Iso.ToString(System.Globalization.CultureInfo.InvariantCulture)}"; }
+        else if (res.Borderline && known && iso > 0.10) { res.Method = "photo"; res.Level = 4; res.MethodNote = $"textured, isotropy {res.Iso.ToString(System.Globalization.CultureInfo.InvariantCulture)}"; }
+    }
+
+    /// <summary>Isotropy of the luma structure: over the pixels whose structure tensor (central differences, 5x5 box)
+    /// has a trace above noise^2, the sum of the smaller eigenvalues over the sum of the larger ones. An edge or a smooth
+    /// gradient has one direction (smaller eigenvalue near 0); grain, foliage, fabric and other photograph texture
+    /// vary in every direction. Computed in bands of rows, so memory stays small on large pictures.</summary>
+    internal static (double iso, long active) Isotropy(RgbImage img, double noise) => Isotropy(img.W, img.H, (y, row) =>
+    {
+        var a = img.Rgb;
+        for (int x = 0, p = y * img.W * 3; x < img.W; x++, p += 3) row[x] = (a[p] * 299 + a[p + 1] * 587 + a[p + 2] * 114 + 500) / 1000;
+    }, noise);
+
+    /// <param name="luma">fills a buffer of w samples with row y of the luma</param>
+    internal static (double iso, long active) Isotropy(int w, int h, Action<int, float[]> luma, double noise)
+    {
+        var t = StructureTiles(w, h, luma, noise, 64);
+        double l1 = 0, l2 = 0; long active = 0;
+        for (int i = 0; i < t.Active.Length; i++) { l1 += t.L1[i]; l2 += t.L2[i]; active += t.Active[i]; }
+        return (l1 > 0 ? l2 / l1 : 0, active);
+    }
+
+    /// <summary>Per tile of tile x tile pixels: the sums of the larger and the smaller eigenvalue of the structure tensor
+    /// over its active pixels, their number, and the number of pixels, so that the isotropy can be read for the whole
+    /// picture or for any region. tile divides 64.</summary>
+    internal sealed class TensorTiles
+    {
+        public int Tile, Tw, Th;
+        public double[] L1 = Array.Empty<double>(), L2 = Array.Empty<double>();
+        public int[] Active = Array.Empty<int>(), Pixels = Array.Empty<int>();
+    }
+
+    internal static TensorTiles StructureTiles(int w, int h, Action<int, float[]> luma, double noise, int tile)
+    {
+        int tw = Math.Max(1, (w + tile - 1) / tile), th = Math.Max(1, (h + tile - 1) / tile);
+        var res = new TensorTiles { Tile = tile, Tw = tw, Th = th, L1 = new double[tw * th], L2 = new double[tw * th], Active = new int[tw * th], Pixels = new int[tw * th] };
+        for (int j = 0; j < th; j++) for (int i = 0; i < tw; i++) res.Pixels[j * tw + i] = Math.Min(tile, w - i * tile) * Math.Min(tile, h - j * tile);
+        if (w < 3 || h < 3) return res;
+        double thr = noise * noise; const int Band = 64;
+        int bands = (h + Band - 1) / Band;
+        // a band of 64 rows holds whole rows of tiles, so no two bands add to the same tile
+        Parallel.For(0, bands, Restorer.Par, b =>
+        {
+            int y0 = b * Band, y1 = Math.Min(h, y0 + Band), r0 = y0 - 2, n = y1 + 2 - r0;
+            // luma rows lo .. hi cover the central differences of tensor rows r0 .. y1 + 1 (clamped into the picture)
+            int lo = Math.Max(0, r0 - 1), hi = Math.Min(h - 1, y1 + 2); var lum = new float[(hi - lo + 1) * w]; var buf = new float[w];
+            for (int r = lo; r <= hi; r++) { luma(r, buf); Array.Copy(buf, 0, lum, (r - lo) * w, w); }
+            // tensor rows, each box-filtered along the row
+            var txx = new float[n * w]; var txy = new float[n * w]; var tyy = new float[n * w];
+            var jxx = new float[w]; var jxy = new float[w]; var jyy = new float[w];
+            for (int k = 0; k < n; k++)
+            {
+                int r = Math.Clamp(r0 + k, 0, h - 1);
+                Array.Clear(jxx); Array.Clear(jxy); Array.Clear(jyy);
+                if (r > 0 && r < h - 1)
+                {
+                    int c = (r - lo) * w, up = c - w, dn = c + w;
+                    for (int x = 1; x < w - 1; x++)
+                    {
+                        float gx = (lum[c + x + 1] - lum[c + x - 1]) * 0.5f, gy = (lum[dn + x] - lum[up + x]) * 0.5f;
+                        jxx[x] = gx * gx; jxy[x] = gx * gy; jyy[x] = gy * gy;
+                    }
+                }
+                int o = k * w;
+                for (int x = 0; x < w; x++)
+                {
+                    float a = 0, c = 0, d = 0;
+                    for (int dx = -2; dx <= 2; dx++) { int xx = Math.Clamp(x + dx, 0, w - 1); a += jxx[xx]; c += jxy[xx]; d += jyy[xx]; }
+                    txx[o + x] = a * 0.2f; txy[o + x] = c * 0.2f; tyy[o + x] = d * 0.2f;
+                }
+            }
+            for (int y = y0; y < y1; y++)
+            {
+                int trow = y / tile * tw;
+                for (int x = 0; x < w; x++)
+                {
+                    float a = 0, c = 0, d = 0;
+                    for (int dy = -2; dy <= 2; dy++) { int i = (Math.Clamp(y + dy, 0, h - 1) - r0) * w + x; a += txx[i]; c += txy[i]; d += tyy[i]; }
+                    double sxx = a * 0.2, sxy = c * 0.2, syy = d * 0.2, t = sxx + syy;
+                    if (t <= thr) continue;
+                    double disc = Math.Sqrt((sxx - syy) * (sxx - syy) + 4 * sxy * sxy);
+                    int ti = trow + x / tile; res.L1[ti] += (t + disc) / 2; res.L2[ti] += (t - disc) / 2; res.Active[ti]++;
+                }
+            }
+        });
         return res;
     }
     /// <summary>Texture of a native-resolution centre crop (up to 512x512). soft: among neighbouring pixel pairs that
@@ -351,6 +479,27 @@ public static class Classifier
                 }
             }
         return (diff > 0 ? Math.Round((double)tiny / diff, 3) : 0, hardWin >= 50 ? Math.Round((double)multi7 / hardWin, 3) : 0);
+    }
+    /// <summary>Share of the picture covered by exactly flat 16x16 tiles (gray range at most 2), tiles aligned with the
+    /// JPEG block grid. A flat area of a drawing or screenshot is a run of blocks with no AC energy and the same DC: it
+    /// decodes exactly flat at any quality. A photograph has grain everywhere, and the smooth areas that a low quality
+    /// does flatten change their DC from block to block, so few 2x2-block tiles stay within two gray levels.</summary>
+    internal static double FlatShare(RgbImage img)
+    {
+        int w = img.W, h = img.H; long tiles = 0, flat = 0; var a = img.Rgb;
+        for (int ty = 0; ty + 16 <= h; ty += 16)
+            for (int tx = 0; tx + 16 <= w; tx += 16)
+            {
+                int mn = 255, mx = 0;
+                for (int j = 0; j < 16 && mx - mn <= 2; j++)
+                    for (int i = 0, p = ((ty + j) * w + tx) * 3; i < 16; i++, p += 3)
+                    {
+                        int v = (a[p] * 299 + a[p + 1] * 587 + a[p + 2] * 114 + 500) / 1000;
+                        if (v < mn) mn = v; if (v > mx) mx = v;
+                    }
+                tiles++; if (mx - mn <= 2) flat++;
+            }
+        return tiles > 0 ? (double)flat / tiles : 0;
     }
     /// <summary>Hard-edge ratio over up to five 256x256 full-resolution crops (centre and four quadrants).</summary>
     static double HardRatioOnCrops(RgbImage full)

@@ -1,7 +1,7 @@
 # Unsquish
 
 Un-squishes compressed images: JPEG artifact restoration, pixel-art upscaling and verified
-lossless re-saving, in one Windows exe with a window and a command line. Version 0.8.0.
+lossless re-saving, in one Windows exe with a window and a command line. Version 0.8.1.
 
 `unsquish.exe` is the whole tool in a single Windows executable: content classification,
 JPEG restoration, pixel-art upscaling, lossless re-saving, JPEG XL output, a before/after
@@ -74,9 +74,9 @@ get distinct outputs (`name.jxl`, `name (2).jxl`).
 
 | Detected | Route | Output |
 |---|---|---|
-| JPEG below the quality threshold (default 90), classed **photo** | level 4: denoising in the DCT domain over all 64 block positions, then chroma smoothed along the luma edges | lossless JPEG XL (`/png` for PNG, `/jpg` for JPEG), ICC and EXIF carried over, the EXIF orientation baked into the pixels |
-| same, classed **art** (flat color, hard lines; also photographed documents) | level 6: the same denoising, then everything that is flat is smoothed; screentone, dither and fine lines are detected and left alone | as above |
-| same, between the two (painting-like; shown as `photo 0.50`) | the art method at level 4 | as above |
+| JPEG below the quality threshold (default 90), classed **photo** | level 4: denoising in the DCT domain over all 64 block positions (eased off on texture below quality 70), then chroma smoothed along the luma edges | lossless JPEG XL (`/png` for PNG, `/jpg` for JPEG), ICC and EXIF carried over, the EXIF orientation baked into the pixels |
+| same, classed **art** (flat color, hard lines; also photographed documents), or classed photo but at least 40 percent exactly flat or free of texture (drawings with soft shading, screenshots, rendered pictures; the log says `art method` and why) | level 6: the same denoising, then everything that is flat is smoothed; screentone, dither and fine lines are detected and left alone | as above |
+| same, between the two (painting-like; shown as `photo 0.50`) | the art method at level 4, or the photo method when its texture is that of a photograph | as above |
 | **pixel art** (sprites, game screens, icons, nearest-neighbor enlargements; JPEG, PNG, GIF, BMP or WebP) | restoration if JPEG (the art method), undo the enlargement, optional `/snap N` palette, crisp nearest-neighbor upscale 2x-4x (never below the undone enlargement, so the output is never smaller than the input). `/smooth` uses xBRZ instead, in passes of at most 6x. A lossless input that is already an exact integer enlargement is left alone | PNG |
 | **animated pixel art** (GIF, animated PNG or WebP whose first frame is pixel art) | the same steps on every frame | animated PNG with the original frame delays and number of plays |
 | JPEG at or above the threshold | reversible JPEG XL transcode, verified by rebuilding the original bytes (with `/png` or `/jpg`: Huffman-optimized JPEG, verified coefficient by coefficient) | `.jxl` (about 20 percent smaller) or `.jpg` |
@@ -87,7 +87,8 @@ get distinct outputs (`name.jxl`, `name (2).jxl`).
 
 File types are recognized from their content, not their extension. The CSV log in the
 output folder records class, confidence, edge ratios, grid factor, quality factor, route,
-action, sizes, timing and the quality of an earlier compression per file.
+action, sizes, timing and the quality of an earlier compression per file; a picture classed
+photo that gets the art method says so in its reason.
 
 ## How the restoration works
 
@@ -102,7 +103,16 @@ is added that the file does not allow. Three stages work inside the bins:
    by the Wiener rule, with the file's own steps as the noise level, and the 64 results are
    averaged. The seams of the original grid fall inside the shifted blocks and average
    away; real detail, which stands far above the noise in the coefficients that carry it,
-   passes. This is the stage that suits photographs: it does not flatten texture.
+   passes. This is the stage that suits photographs: it does not flatten texture. Fine
+   texture that stands only just above the noise does lose contrast, so below quality 70
+   the photo method measures the isotropy of the luma (see How the classifier decides) in
+   regions of about 100 pixels and runs this stage and the edge-aware pass at half
+   strength on photograph texture (0.25 and up) and not at all on grain-like texture (0.45
+   and up), which a low quality cannot keep anyway. A region with nothing above the noise
+   is smooth and gets the full stage; one with only fainter structure (texture the
+   compression all but wiped out) follows the picture as a whole. A sky above a field of
+   grain is denoised as before while the grain stays as decoded. On the Kodak set this
+   raises SSIM at quality 10 to 50 and keeps PSNR.
 2. **Chroma along the luma edges** (photos, level 4 and up). Color is stored at half
    resolution in most JPEGs. Instead of interpolating it, chroma is solved for at full
    resolution: total variation over all three channels jointly, luma held fixed, so that
@@ -131,7 +141,30 @@ on the comb; their levels are recovered by assuming the clipped pixels went furt
 - **edge hardness** on a point-sampled proxy *and* on full-resolution crops; art requires
   hard edges in both (large photos look hard-edged on the proxy only). A picture that is
   nearly as hard-edged as a drawing is called a photo with confidence 0.50 and gets the
-  art method at the photo level.
+  art method at the photo level, unless its texture is a photograph's (next point).
+- **the method** for a picture classed photo is judged by what the two methods do to it,
+  not by the label. Drawings with soft shading, painterly styles and screenshots have soft edges
+  and fail the edge test, yet the art method gains them about twice as much (six such test
+  drawings: +2.25 / +2.98 / +3.50 dB at quality 10 / 30 / 70, the photo method +1.23 /
+  +1.46 / +1.89). Two measures on the plain decode find them, and both stay put from
+  quality 10 to 85:
+  - *flat area*: the share of the picture in exactly flat 16x16 tiles (gray range of at
+    most 2). Flat color decodes exactly flat at any quality; a camera photograph has grain
+    everywhere, and the smooth areas that a low quality flattens change their level from
+    block to block. At 40 percent or more the picture gets the art method at level 6.
+  - *isotropy*: over the pixels whose 5x5 structure tensor stands above the noise scale of
+    the compression, the sum of the smaller eigenvalues divided by the sum of the larger
+    ones. Edges and smooth
+    gradients have one direction (near 0), grain, foliage, fabric and skin vary in all
+    (photographs 0.09 to 0.35). At 0.08 or less the picture gets the art method at level 6;
+    a borderline picture above 0.10 gets the photo method instead of the art method.
+
+  On the 406 test JPEGs, the 19 drawings have 21 to 83 percent flat area at every quality
+  except one drawing on a photographic background (7 to 27 percent); the 24 Kodak
+  photographs have at most 45 percent (the sky of one, at quality 10) and at most 40 from
+  quality 30 up. The isotropy of the soft-shaded drawings is 0.03 to 0.08, that of the
+  Kodak photographs 0.09 to 0.35 and of the textures 0.09 to 0.58. The classes, and so the
+  labels in the log, are the ones of the edge test.
 - **color density** (unique colors per pixel): palette images are below 2 percent
 - **pixel grid**: a nearest-neighbor round trip that beats a box-filtered one by 3 dB
   reveals a 2x-8x nearest-neighbor enlargement, which is undone before upscaling. Every grid
@@ -146,7 +179,8 @@ on the comb; their levels are recovered by assuming the clipped pixels went furt
 Calibrated on 16 test images, the 47 game screens shipped with xBRZ, 37 dithered GIF
 renditions of photos and drawings, and a library of 111 real images (phone photos,
 screenshots, drawings, memes). The classes are the same as in 0.7.1 on every file of the
-calibration sets.
+calibration sets. The method thresholds were set on the restoration gains of the 406 test
+JPEGs (see Restoration quality).
 
 ## Options
 
@@ -184,11 +218,22 @@ Photographs, default settings (level 4):
 | Set | Version | q10 | q20 | q30 | q50 | q70 | q85 |
 |---|---|---|---|---|---|---|---|
 | 24 Kodak photographs (film, textured) | 0.7.1 | +0.52 / +2.0 | +0.29 / -5.7 | +0.16 / -6.6 | +0.04 / -7.0 | -0.05 / -6.9 | -0.39 / -8.3 |
-| | **0.8** | **+0.99 / +20.9** | **+0.89 / +12.2** | **+0.84 / +9.3** | **+0.80 / +6.8** | **+0.81 / +5.4** | **+0.78 / +3.7** |
+| | 0.8.0 | +0.99 / +20.9 | +0.89 / +12.2 | +0.84 / +9.3 | +0.80 / +6.8 | +0.81 / +5.4 | +0.78 / +3.7 |
+| | **0.8.1** | **+1.00 / +21.6** | **+0.90 / +13.0** | **+0.85 / +10.1** | **+0.80 / +7.3** | **+0.81 / +5.4** | **+0.78 / +3.7** |
 | 9 clean digital photographs (Windows wallpapers) | 0.7.1 | +0.90 / +19.4 | +0.94 / +11.4 | +0.87 / +7.2 | +0.77 / +3.9 | +0.70 / +2.2 | +0.48 / +0.5 |
 | | **0.8** | **+1.69 / +26.8** | **+1.87 / +15.1** | **+1.81 / +10.0** | **+1.69 / +5.7** | **+1.61 / +3.6** | **+1.60 / +2.0** |
 | 6 synthetic textures (leaves, clouds, grain, skin) | 0.7.1 | +0.54 / -1.6 | +0.37 / -6.0 | +0.26 / -5.6 | +0.18 / -4.4 | +0.15 / -3.8 | -0.02 / -5.3 |
-| | **0.8** | **+1.06 / +16.5** | **+0.99 / +8.9** | **+0.95 / +6.4** | **+0.97 / +5.1** | **+1.03 / +4.7** | **+1.02 / +3.0** |
+| | 0.8.0 | +1.06 / +16.5 | +0.99 / +8.9 | +0.95 / +6.4 | +0.97 / +5.1 | +1.03 / +4.7 | +1.02 / +3.0 |
+| | **0.8.1** | **+0.98 / +22.5** | **+0.94 / +14.1** | **+0.88 / +9.9** | **+0.85 / +6.4** | **+1.03 / +4.7** | **+1.04 / +3.0** |
+
+*0.8.1*: below quality 70 the photo method eases off in regions of isotropic texture (see
+How the restoration works). The clean digital photographs are unchanged (within 0.001 dB).
+On the textures the SSIM gain rises by a third to a half at quality 10 to 30; the PSNR gain
+falls by 0.05 to 0.12 dB, all of it on the foliage, which is left as decoded there (see
+Limitations). Three composites of a sky over the foliage, at quality 10 / 30 / 50: the sky
+gains +0.9 to +2.0 dB, within 0.3 dB of the full method that 0.8.0 runs everywhere, and the
+whole picture stays above a plain decode in SSIM (+5.2 / +3.1 / +2.0 x 1000; 0.8.0: -8.2 /
+-6.4 / -1.1).
 
 Drawings, default settings (level 6):
 
@@ -200,26 +245,61 @@ Drawings, default settings (level 6):
 | | **0.8** | **+1.72 / +21.6** | **+2.08 / +14.5** | **+2.58 / +11.1** | **+2.54 / +7.3** | **+3.03 / +5.1** | **+3.50 / +2.6** |
 
 The same pictures with 4:4:4 chroma at quality 30: drawings +2.86 dB (0.7.1: +0.70),
-synthetic drawings +2.96 (+0.84), Kodak +0.95 (+0.23), clean photographs +2.26 (+1.19),
-textures +1.31 (+0.44).
+synthetic drawings +2.96 (+0.84), Kodak +0.96 (+0.23), clean photographs +2.26 (+1.19),
+textures +1.25 (+0.44; 0.8.0: +1.31 with SSIM +6.3, 0.8.1: +9.9).
 
 Levels, at quality 30 (time on a four-core laptop processor from 2019, restoration only):
 
 | Level | Kodak photographs | s per megapixel | Drawings | s per megapixel |
 |---|---|---|---|---|
 | 2 | +0.74 dB | 0.1 | +0.89 dB | 0.1 |
-| 3 | +0.77 dB | 0.1-0.2 | +1.80 dB | 0.4-0.7 |
-| 4 | +0.84 dB (default) | 0.4-0.7 | +2.21 dB | 0.7-1.1 |
-| 5 | +0.86 dB | 0.6-0.9 | +2.49 dB | 1.1-1.5 |
-| 6 | +0.88 dB | 0.9-1.1 | +2.66 dB (default) | 1.6-1.9 |
+| 3 | +0.78 dB | 0.1-0.2 | +1.80 dB | 0.4-0.7 |
+| 4 | +0.85 dB (default) | 0.4-0.7 | +2.21 dB | 0.7-1.1 |
+| 5 | +0.87 dB | 0.6-0.9 | +2.49 dB | 1.1-1.5 |
+| 6 | +0.89 dB | 0.9-1.1 | +2.66 dB (default) | 1.6-1.9 |
 
 The smaller time is for a 22-megapixel picture, the larger for pictures under one megapixel.
 
-When the classifier is wrong: drawings sent down the photo route still gain +1.11 / +1.28 /
+When the method is wrong: drawings sent down the photo route still gain +1.10 / +1.27 /
 +1.64 dB at quality 10 / 30 / 70 (instead of +2.07 / +2.66 / +2.96). Kodak photographs sent
-down the art route gain +0.99 / +0.82 / +0.81 dB, the same as on their own route, with
-a smaller SSIM gain (+12.7 / +4.2 / +4.8 against +20.9 / +9.3 / +5.4); they stay above a
-plain decode in both measures at every quality tested.
+down the art route gain +0.99 / +0.82 / +0.81 dB, about the same as on their own route,
+with a smaller SSIM gain (+12.7 / +4.2 / +4.8 against +21.6 / +10.1 / +5.4); on average
+they stay above a plain decode in both measures at every quality tested.
+
+The method chosen automatically (default levels; 0.8.0 decided by the edge test alone,
+0.8.1 also by flat area and isotropy, and its photo method eases off on texture), against
+the better of the art and the photo method for each file:
+
+| Set | Choice | q10 | q20 | q30 | q50 | q70 | q85 |
+|---|---|---|---|---|---|---|---|
+| 12 drawings | 0.8.0 | +1.85 / +24.2 | +1.96 / +16.7 | +2.28 / +13.1 | +2.56 / +9.3 | +2.69 / +6.9 | +2.82 / +3.1 |
+| | **0.8.1** | **+2.02 / +24.6** | **+2.26 / +17.6** | **+2.64 / +13.9** | **+2.84 / +9.4** | **+2.96 / +7.0** | **+3.01 / +3.2** |
+| | better of the two | +2.07 / +25.7 | +2.28 / +17.7 | +2.66 / +13.9 | +2.84 / +9.4 | +2.96 / +7.0 | +3.01 / +3.2 |
+| 7 synthetic drawings | 0.8.0 | +1.20 / +18.6 | +1.58 / +13.5 | +1.89 / +10.1 | +2.24 / +7.2 | +2.84 / +5.0 | +3.38 / +2.5 |
+| | **0.8.1** | **+1.72 / +21.6** | **+2.08 / +14.5** | **+2.58 / +11.1** | **+2.54 / +7.3** | **+3.03 / +5.1** | **+3.50 / +2.6** |
+| | better of the two | +1.72 / +21.6 | +2.08 / +14.5 | +2.58 / +11.1 | +2.54 / +7.3 | +3.03 / +5.0 | +3.54 / +2.5 |
+| 24 Kodak photographs | 0.8.0 | +0.99 / +20.7 | +0.89 / +12.1 | +0.84 / +9.3 | +0.80 / +6.8 | +0.81 / +5.4 | +0.78 / +3.7 |
+| | **0.8.1** | **+1.01 / +21.6** | **+0.90 / +12.9** | **+0.85 / +10.1** | **+0.80 / +7.3** | **+0.81 / +5.4** | **+0.78 / +3.7** |
+| | better of the two | +1.05 / +20.6 | +0.92 / +11.6 | +0.87 / +8.7 | +0.85 / +6.2 | +0.83 / +5.3 | +0.79 / +3.7 |
+| 9 clean digital photographs | 0.8.0 | +1.60 / +24.9 | +1.87 / +15.1 | +1.81 / +10.0 | +1.69 / +5.7 | +1.62 / +3.6 | +1.61 / +2.0 |
+| | **0.8.1** | **+2.32 / +31.0** | **+2.54 / +17.8** | **+2.42 / +11.9** | **+2.27 / +6.6** | **+2.04 / +4.4** | **+1.86 / +2.3** |
+| | better of the two | +2.38 / +32.7 | +2.55 / +17.9 | +2.46 / +11.8 | +2.28 / +6.6 | +2.09 / +4.3 | +1.90 / +2.3 |
+| 6 synthetic textures | 0.8.0 | +1.15 / +18.3 | +1.17 / +10.2 | +1.12 / +7.3 | +1.12 / +5.4 | +1.15 / +4.7 | +1.12 / +2.9 |
+| | **0.8.1** | **+1.24 / +25.0** | **+1.11 / +15.5** | **+1.05 / +10.9** | **+1.01 / +6.8** | **+1.15 / +4.7** | **+1.12 / +2.9** |
+| | better of the two | +1.42 / +17.3 | +1.36 / +9.0 | +1.35 / +7.4 | +1.37 / +5.9 | +1.38 / +5.2 | +1.26 / +3.2 |
+
+"Better of the two" picks by PSNR, so its SSIM can be lower. Of the 76 drawing files at
+quality 10 / 30 / 70 / 85, 0.8.0 restored 12 with the photo method, 0.8.1 restores 1
+(a drawing on a photographic background, at quality 10). The clean digital photographs
+are rendered pictures without grain and get the art method at most qualities. Of the
+photographs and textures, only the picture with the large sky (quality 10 and 20: +0.31
+and +0.16 dB) and the grain texture at quality 10 (+0.82 dB) moved to the art method; the
+Kodak photographs of the borderline band went back to the photo method (+0.1 to +5.7
+SSIM, -0.2 on one file). Textures keep a gap to the better method in PSNR: the foliage is
+left as decoded below quality 70, and on the large leaves and, at some qualities, the fine
+leaves and the grain, the art method wins although their structure is as isotropic as a
+photograph's. No Kodak or texture file ends below a plain decode in SSIM any more (0.8.0:
+seven); the foliage matches it to within 0.04 x 1000.
 
 Pixel art saved as JPEG (8 sprite screens, 4:2:0): enlarged four times, +2.47 / +4.08 /
 +7.32 dB at quality 50 / 75 / 90 (0.7.1: +0.56 / +0.43 / +0.27); at native size +0.46 /
@@ -248,9 +328,21 @@ The benchmark and the regression suite are in `tools/` (see Building).
 
 ## Limitations
 
-- Content detection is the same as before, and it matters more now: some drawings (soft
-  shading, painterly styles) are taken for photographs and get the photo method, which
-  gains about half as much on them. For a folder of drawings, force *Content = Art*.
+- Content detection: a drawing without flat areas whose shading reads as texture still
+  gets the photo method, which gains about half as much on it. Among the 76 test drawing
+  files at quality 10 / 30 / 70 / 85 that is one, a drawing on a photographic background
+  at quality 10 (+0.91 dB where the art method gives +1.50). For a folder of drawings,
+  force *Content = Art*. The other way round, a photograph that is 40 percent exactly flat
+  (clipped sky, a studio backdrop, a wide plain frame) gets the art method; on the test
+  photographs that costs at most 2.3 SSIM x 1000 and gains PSNR.
+- Grain-like texture (isotropy 0.45 and up, such as the synthetic foliage) is left as
+  decoded below quality 70; only its chroma is restored, so it gains +0.01 to +0.03 dB
+  instead of +0.4 to +0.8. A low quality cannot keep grain, and any smoothing of what is
+  left takes SSIM below a plain decode (6 to 33 x 1000 on that texture with 0.8.0).
+- A drawing restored with the photo method (forced with *Content = Photo*, or missed by the
+  method test) keeps its screentone and hatching as decoded below quality 70, where they
+  read as isotropic texture: up to 1.1 dB less on a screentone page than with 0.8.0. The
+  art method, which drawings get by default, is not affected.
 - An earlier compression is recognized only when the picture was not resized in between
   (a crop is fine) and the first compression used a standard table. Resized pictures gain
   little. Flat-color drawings saved again as JPEG are recognized about half the time.
@@ -275,13 +367,13 @@ The benchmark and the regression suite are in `tools/` (see Building).
 
 ## Building
 
-Requires the .NET 10 SDK on 64-bit Windows. The six libjxl 0.12.0 DLLs are in `native/`.
+Requires the .NET 11 SDK on 64-bit Windows. The six libjxl 0.12.0 DLLs are in `native/`.
 
 ```text
 dotnet publish -c Release -o publish -p:PublishTrimmed=true -p:TrimMode=partial
 ```
 
-The result is `publish\unsquish.exe`, one self-contained file of about 26 MB.
+The result is `publish\unsquish.exe`, one self-contained file of about 28 MB.
 
 ImageSharp stays on the 3.1 line (3.2 and 4.x need a Six Labors license key at build
 time). NuGet lists advisories against 3.1.12; they concern the TIFF decoder, a
@@ -311,6 +403,6 @@ six advisories by name, so a new one still shows up.
 - libjxl 0.12.0 by the JPEG XL Project Authors, BSD-3-Clause with patent grant (bundled DLLs, extracted at start-up)
 - XbrzSharp by Ho Tzin Mein, a port of xBRZ by Zenju, GPL-3.0 (pixel-art upscaling)
 - ImageSharp by Six Labors, Six Labors Split License (PNG/GIF/BMP/WebP decoding)
-- .NET 10 runtime and Windows Forms by Microsoft, MIT
+- .NET 11 runtime and Windows Forms by Microsoft, MIT
 
 Because of xBRZ the combined executable is distributed under GPL-3.0; the tool's own source is this repository.

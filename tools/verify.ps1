@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = 'Continue'
 $repo = Split-Path $PSScriptRoot -Parent
 $td = Join-Path $repo 'testdata'
-if (-not $Exe) { $Exe = @((Join-Path $repo 'publish\unsquish.exe'), (Join-Path $repo 'bin\Release\net10.0-windows\win-x64\unsquish.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+if (-not $Exe) { $Exe = @((Join-Path $repo 'publish\unsquish.exe'), (Join-Path $repo 'bin\Release\net11.0-windows\win-x64\unsquish.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1 }
 $bench = Join-Path $repo "tools\bench\$BenchDir\unsquish-bench.exe"
 foreach ($need in $Exe, $bench, $Magick, (Join-Path $td 'refs\kodak'), (Join-Path $td 'jpg\kodak')) { if (-not $need -or -not (Test-Path $need)) { "missing: $need"; exit 2 } }
 $inv = [Globalization.CultureInfo]::InvariantCulture

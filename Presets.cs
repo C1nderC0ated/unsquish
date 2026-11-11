@@ -21,11 +21,12 @@ public static class Presets
             return (new RestoreParams { Shifts = 64, Shrink = 0.3f, Iterations = it, Fidelity = 1f },
                     $"DCT denoising over 64 block shifts + guarded smoothing ({it} iterations)");
         }
+        // photographs: the denoising eases off in regions of isotropic texture below quality 70 (Restorer.TextureMap)
         if (level == 3)
-            return (new RestoreParams { Shifts = 64, PocsIterations = 1, Shrink = 0.3f }, "DCT denoising over 64 block shifts");
-        // photographs: luma keeps its texture, only chroma is smoothed, guided by the luma edges
+            return (new RestoreParams { Shifts = 64, PocsIterations = 1, Shrink = 0.3f, TextureAdapt = true }, "DCT denoising over 64 block shifts");
+        // luma keeps its texture, only chroma is smoothed, guided by the luma edges
         int ci = level == 4 ? 30 : (level == 5 ? 60 : 100);
-        return (new RestoreParams { Shifts = 64, PocsIterations = 1, Shrink = 0.3f, Iterations = ci, ChromaOnly = true },
+        return (new RestoreParams { Shifts = 64, PocsIterations = 1, Shrink = 0.3f, Iterations = ci, ChromaOnly = true, TextureAdapt = true },
                 $"DCT denoising over 64 block shifts + luma-guided chroma ({ci} iterations)");
     }
 
